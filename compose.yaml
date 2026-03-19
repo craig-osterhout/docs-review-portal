@@ -1,0 +1,20 @@
+services:
+  review:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      REVIEW_BIND: 0.0.0.0
+      PORT: 8080
+      REVIEW_PUBLIC_PORT: 8080
+      REVIEW_DATA_DIR: /app/data
+      REVIEW_DEFAULT_REVIEWER: reviewer
+      REVIEW_SITE_STORAGE: filesystem
+    volumes:
+      - review_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  review_data:
