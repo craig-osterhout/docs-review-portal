@@ -50,10 +50,13 @@ OUT_REL="tmp/review-site/$NAME"
 OUT="$DOCS_DIR/$OUT_REL"
 ARCHIVE_REL="tmp/review-site/$NAME.tar.gz"
 ARCHIVE="$DOCS_DIR/$ARCHIVE_REL"
+CHUNKS_REL="tmp/review-site/chunks-$NAME"
+CHUNKS_DIR="$DOCS_DIR/$CHUNKS_REL"
 TMP_ROOT_REL="tmp/review-site"
+CHUNK_SIZE=20971520  # 20 MiB — safely under the 32 MiB Cloud Run HTTP/1.1 body limit
 
 cleanup() {
-  (cd "$DOCS_DIR" && rm -rf "$OUT_REL" "$ARCHIVE_REL")
+  (cd "$DOCS_DIR" && rm -rf "$OUT_REL" "$ARCHIVE_REL" "$CHUNKS_REL")
   (cd "$DOCS_DIR" && rmdir "$TMP_ROOT_REL" 2>/dev/null || true)
 }
 trap cleanup EXIT INT TERM
@@ -64,6 +67,25 @@ mkdir -p "$OUT" "$(dirname "$ARCHIVE")"
 (cd "$DOCS_DIR" && docker buildx bake release --set "release.output=type=local,dest=$OUT_REL")
 # Package the built site as a .tar.gz upload payload.
 (cd "$DOCS_DIR" && tar -C "$OUT_REL" -czf "$ARCHIVE_REL" .)
-# Upload archive and wait for server processing to complete.
-(cd "$DOCS_DIR" && curl --fail --show-error -X POST "$URL/api/builds/upload?name=$NAME&rewrite_host=$REWRITE_HOST" -H "Content-Type: application/gzip" --data-binary "@$ARCHIVE_REL")
+# Upload archive — split into 20 MiB chunks if the archive exceeds the server body limit.
+ARCHIVE_BYTES="$(wc -c < "$ARCHIVE" | tr -d ' \t\n')"
+if [ "$ARCHIVE_BYTES" -gt "$CHUNK_SIZE" ]; then
+  mkdir -p "$CHUNKS_DIR"
+  split -d -a 4 -b "$CHUNK_SIZE" "$ARCHIVE" "$CHUNKS_DIR/chunk-"
+  TOTAL="$(ls "$CHUNKS_DIR"/chunk-* | wc -l | tr -d ' \t\n')"
+  IDX=0
+  for CHUNK in "$CHUNKS_DIR"/chunk-*; do
+    printf 'Uploading part %d/%d...\n' "$((IDX + 1))" "$TOTAL" >&2
+    (cd "$DOCS_DIR" && curl --fail --show-error --ssl-no-revoke \
+      -X POST "$URL/api/builds/upload?name=$NAME&chunk=$IDX&chunks=$TOTAL&rewrite_host=$REWRITE_HOST" \
+      -H "Content-Type: application/octet-stream" \
+      --data-binary "@$CHUNK")
+    IDX=$((IDX + 1))
+  done
+else
+  (cd "$DOCS_DIR" && curl --fail --show-error --ssl-no-revoke \
+    -X POST "$URL/api/builds/upload?name=$NAME&rewrite_host=$REWRITE_HOST" \
+    -H "Content-Type: application/gzip" \
+    --data-binary "@$ARCHIVE_REL")
+fi
 echo "Submitted."

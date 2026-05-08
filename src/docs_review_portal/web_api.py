@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import re
+import shutil
+import tempfile
 from http import HTTPStatus
+from pathlib import Path
 
 from docs_review_portal.config import (
     DEFAULT_REVIEWER,
@@ -85,11 +88,69 @@ class ReviewApiMixin:
                 )
                 return
 
-        try:
-            archive_path = self._read_body_to_temp_file()
-        except Exception as exc:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-            return
+        chunk_str = (query.get("chunk", [""])[0] or "").strip()
+        chunks_str = (query.get("chunks", [""])[0] or "").strip()
+        staging_dir: Path | None = None
+
+        if chunk_str or chunks_str:
+            try:
+                chunk_idx = int(chunk_str)
+                total_chunks = int(chunks_str)
+                if total_chunks < 1 or chunk_idx < 0 or chunk_idx >= total_chunks:
+                    raise ValueError("chunk index out of range")
+            except (ValueError, TypeError):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "chunk and chunks must be integers with 0 <= chunk < chunks"},
+                )
+                return
+
+            staging_dir = Path(tempfile.gettempdir()) / f"review-upload-{tag}"
+            staging_dir.mkdir(exist_ok=True)
+
+            try:
+                chunk_path = self._read_body_to_temp_file()
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+
+            dest = staging_dir / f"{chunk_idx:06d}.bin"
+            try:
+                chunk_path.rename(dest)
+            except Exception:
+                chunk_path.unlink(missing_ok=True)
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "failed to store chunk"})
+                return
+
+            if chunk_idx < total_chunks - 1:
+                self._send_json(HTTPStatus.OK, {"status": "chunk received", "chunk": chunk_idx, "chunks": total_chunks})
+                return
+
+            missing = [i for i in range(total_chunks) if not (staging_dir / f"{i:06d}.bin").exists()]
+            if missing:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"missing chunks: {missing[:5]}"})
+                return
+
+            archive_path = staging_dir / "assembled.tar.gz"
+            try:
+                with archive_path.open("wb") as out:
+                    for i in range(total_chunks):
+                        chunk_file = staging_dir / f"{i:06d}.bin"
+                        with chunk_file.open("rb") as src:
+                            shutil.copyfileobj(src, out)
+                        chunk_file.unlink()
+            except Exception as exc:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"failed to assemble chunks: {exc}"})
+                return
+        else:
+            try:
+                archive_path = self._read_body_to_temp_file()
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+
         source_ref = (query.get("source_ref", [""])[0] or "").strip() or None
 
         try:
@@ -101,10 +162,18 @@ class ReviewApiMixin:
                 rewrite_host=rewrite_host,
             )
         except Exception as exc:
-            archive_path.unlink(missing_ok=True)
+            if staging_dir:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+            else:
+                archive_path.unlink(missing_ok=True)
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
-        archive_path.unlink(missing_ok=True)
+
+        if staging_dir:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        else:
+            archive_path.unlink(missing_ok=True)
+
         self._send_json(
             HTTPStatus.CREATED,
             {
