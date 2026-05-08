@@ -219,16 +219,21 @@ class GCSSiteStore(SiteStore):
 
     def replace_site_from_archive(self, archive_path: Path, tag: str) -> None:
         site_prefix = self._snapshot_prefix(tag, "site")
-        with tempfile.TemporaryDirectory(prefix="review-site-") as tmp:
-            staging_root = Path(tmp) / "site"
-            extract_site_archive(archive_path, staging_root)
-            for file_path in staging_root.rglob("*"):
-                if not file_path.is_file():
+        with tarfile.open(archive_path, mode="r:*") as archive:
+            for member in archive.getmembers():
+                if not member.isreg():
                     continue
-                rel = file_path.relative_to(staging_root).as_posix()
-                ctype = mimetypes.guess_type(rel)[0] or "application/octet-stream"
-                blob = self._bucket.blob(f"{site_prefix}{rel}")
-                blob.upload_from_filename(str(file_path), content_type=ctype)
+                rel = Path(member.name)
+                parts = [part for part in rel.parts if part not in ("", ".")]
+                if not parts or ".." in parts:
+                    continue
+                rel_str = Path(*parts).as_posix()
+                src = archive.extractfile(member)
+                if src is None:
+                    continue
+                ctype = mimetypes.guess_type(rel_str)[0] or "application/octet-stream"
+                blob = self._bucket.blob(f"{site_prefix}{rel_str}")
+                blob.upload_from_string(src.read(), content_type=ctype)
 
     def read_file(self, tag: str, rel_path: str) -> bytes | None:
         blob = self._bucket.blob(f"{self._snapshot_prefix(tag, 'site')}{rel_path}")

@@ -1,10 +1,39 @@
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 import tempfile
+import threading
 from http import HTTPStatus
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
+
+
+def _run_import(
+    archive_path: Path,
+    staging_dir: Path | None,
+    tag: str,
+    display_name: str,
+    source_ref: str | None,
+    rewrite_host: str,
+) -> None:
+    try:
+        import_build_archive_path(
+            archive_path=archive_path,
+            tag=tag,
+            display_name=display_name,
+            source_ref=source_ref,
+            rewrite_host=rewrite_host,
+        )
+    except Exception as exc:
+        _log.error("import failed for %r: %s", tag, exc)
+    finally:
+        if staging_dir is not None:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        else:
+            archive_path.unlink(missing_ok=True)
 
 from docs_review_portal.config import (
     DEFAULT_REVIEWER,
@@ -153,37 +182,19 @@ class ReviewApiMixin:
 
         source_ref = (query.get("source_ref", [""])[0] or "").strip() or None
 
-        try:
-            result = import_build_archive_path(
-                archive_path=archive_path,
-                tag=tag,
-                display_name=display_name,
-                source_ref=source_ref,
-                rewrite_host=rewrite_host,
-            )
-        except Exception as exc:
-            if staging_dir:
-                shutil.rmtree(staging_dir, ignore_errors=True)
-            else:
-                archive_path.unlink(missing_ok=True)
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-            return
-
-        if staging_dir:
-            shutil.rmtree(staging_dir, ignore_errors=True)
-        else:
-            archive_path.unlink(missing_ok=True)
+        threading.Thread(
+            target=_run_import,
+            args=(archive_path, staging_dir, tag, display_name, source_ref, rewrite_host),
+            daemon=True,
+        ).start()
 
         self._send_json(
-            HTTPStatus.CREATED,
+            HTTPStatus.ACCEPTED,
             {
-                "build_id": result.build_id,
-                "tag": result.tag,
-                "name": result.display_name,
-                "image_ref": result.image_ref,
-                "display_name": result.display_name,
+                "tag": tag,
+                "name": display_name,
                 "rewrite_host": rewrite_host or None,
-                "site_url": build_url(result.tag),
+                "site_url": build_url(tag),
             },
         )
 
