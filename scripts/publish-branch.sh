@@ -76,14 +76,14 @@ if [ "$ARCHIVE_BYTES" -gt "$CHUNK_SIZE" ]; then
   IDX=0
   for CHUNK in "$CHUNKS_DIR"/chunk-*; do
     printf 'Uploading part %d/%d...\n' "$((IDX + 1))" "$TOTAL" >&2
-    (cd "$DOCS_DIR" && curl --fail --show-error --ssl-no-revoke \
+    (cd "$DOCS_DIR" && curl --fail --show-error --ssl-no-revoke -o /dev/null \
       -X POST "$URL/api/builds/upload?name=$NAME&chunk=$IDX&chunks=$TOTAL&rewrite_host=$REWRITE_HOST" \
       -H "Content-Type: application/octet-stream" \
       --data-binary "@$CHUNK")
     IDX=$((IDX + 1))
   done
 else
-  (cd "$DOCS_DIR" && curl --fail --show-error --ssl-no-revoke \
+  (cd "$DOCS_DIR" && curl --fail --show-error --ssl-no-revoke -o /dev/null \
     -X POST "$URL/api/builds/upload?name=$NAME&rewrite_host=$REWRITE_HOST" \
     -H "Content-Type: application/gzip" \
     --data-binary "@$ARCHIVE_REL")

@@ -19,22 +19,28 @@ def _run_import(
     source_ref: str | None,
     rewrite_host: str,
 ) -> None:
+    _log.info("import started for %r (archive: %s, size: %d bytes)", tag, archive_path, archive_path.stat().st_size)
     try:
-        import_build_archive_path(
+        result = import_build_archive_path(
             archive_path=archive_path,
             tag=tag,
             display_name=display_name,
             source_ref=source_ref,
             rewrite_host=rewrite_host,
+            stage_callback=lambda stage: _log.info("import %r: %s", tag, stage),
         )
+        _log.info("import complete for %r (build_id: %d)", tag, result.build_id)
     except Exception as exc:
-        _log.error("import failed for %r: %s", tag, exc)
+        _log.error("import failed for %r: %s", tag, exc, exc_info=True)
     finally:
         if staging_dir is not None:
             shutil.rmtree(staging_dir, ignore_errors=True)
         else:
             archive_path.unlink(missing_ok=True)
 
+import html as _html
+
+from docs_review_portal import log_buffer
 from docs_review_portal.config import (
     DEFAULT_REVIEWER,
     DEFAULT_REWRITE_HOST,
@@ -151,6 +157,7 @@ class ReviewApiMixin:
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "failed to store chunk"})
                 return
 
+            _log.info("chunk %d/%d received for %r (%d bytes)", chunk_idx + 1, total_chunks, tag, dest.stat().st_size)
             if chunk_idx < total_chunks - 1:
                 self._send_json(HTTPStatus.OK, {"status": "chunk received", "chunk": chunk_idx, "chunks": total_chunks})
                 return
@@ -256,6 +263,34 @@ class ReviewApiMixin:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
         self._send_json(HTTPStatus.OK, {"status": "ok", "resolved": resolved})
+
+    def _render_logs_page(self) -> None:
+        entries = log_buffer.get_entries()
+        rows = "".join(
+            f"<tr class='lvl-{e['level'].lower()}'>"
+            f"<td>{_html.escape(e['ts_human'])}</td>"
+            f"<td>{_html.escape(e['level'])}</td>"
+            f"<td>{_html.escape(e['logger'])}</td>"
+            f"<td>{_html.escape(e['msg'])}</td>"
+            f"</tr>"
+            for e in reversed(entries)
+        )
+        body = f"""
+<h1>Logs <small>({len(entries)} entries)</small></h1>
+<p><a href='/logs'>Refresh</a></p>
+<style>
+table{{width:100%;border-collapse:collapse;font-size:.85em;font-family:monospace}}
+th,td{{padding:4px 8px;border:1px solid #ddd;text-align:left;vertical-align:top}}
+th{{background:#f4f4f4}}
+.lvl-error td{{background:#fff0f0}}
+.lvl-warning td{{background:#fffbe6}}
+</style>
+<table>
+<thead><tr><th>Time</th><th>Level</th><th>Logger</th><th>Message</th></tr></thead>
+<tbody>{rows or '<tr><td colspan=4>No log entries yet.</td></tr>'}</tbody>
+</table>"""
+        from docs_review_portal.helpers import html_page
+        self._send_html(HTTPStatus.OK, html_page("Logs", body))
 
     def _api_reply_comment(self, path: str) -> None:
         match = re.match(r"^/api/comments/(\d+)/reply$", path)

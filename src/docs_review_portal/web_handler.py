@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlparse
 
 from docs_review_portal.config import HOST, PORT
 from docs_review_portal.data import init_storage, purge_expired_archived_builds
+from docs_review_portal import log_buffer
 from docs_review_portal.web_api import ReviewApiMixin
 from docs_review_portal.web_common import ReviewCommonMixin
 from docs_review_portal.web_pages import ReviewPagesMixin
@@ -82,6 +83,9 @@ class ReviewHandler(
         if path == "/api/comments":
             self._api_get_comments(query)
             return
+        if path == "/logs":
+            self._render_logs_page()
+            return
         if self._serve_build_from_tagged_path(path):
             return
         if self._serve_build_from_context(path):
@@ -125,6 +129,12 @@ class ReviewHandler(
 
 
 def serve() -> None:
+    log_buffer.setup()
+    import logging
+    from docs_review_portal.config import DATA_DIR, DB_BACKEND, SITE_STORAGE_BACKEND
+    logging.getLogger(__name__).info(
+        "starting: storage=%s data_dir=%s db=%s", SITE_STORAGE_BACKEND, DATA_DIR, DB_BACKEND
+    )
     init_storage()
     try:
         purge_expired_archived_builds()

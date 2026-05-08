@@ -197,6 +197,7 @@ def html_page(title: str, body: str) -> str:
     <nav class="nav">
       <a href="/previews">Previews</a>
       <a href="/comments">Comments</a>
+      <a href="/logs">Logs</a>
     </nav>
   </header>
   <main class="app-shell">
