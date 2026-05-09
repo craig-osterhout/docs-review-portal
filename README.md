@@ -99,6 +99,7 @@ Open:
 
 - `http://localhost:8080/previews`
 - `http://localhost:8080/comments`
+- `http://localhost:8080/logs`
 - `http://localhost:8080/healthz`
 
 ## Add a preview (API)
@@ -106,25 +107,62 @@ Open:
 ```bash
 curl -X POST "http://localhost:8080/api/builds/upload?name=my-docs-review&rewrite_host=docs.docker.com" \
   -H "Content-Type: application/gzip" \
-  --data-binary "@tmp/review-site/my-docs-review.tar.gz"
+  --data-binary "@my-docs-review.tar.gz"
 ```
 
-Upload flow:
+The response streams server-side progress lines and finishes with a `result:` JSON line on success or `error:` on failure.
 
-1. `POST /api/builds/upload?name=<name>[&rewrite_host=<host>]`
-2. server stores and registers the preview
+**Query parameters:**
 
-The app will:
+- `name` (required) — preview name, normalized to a URL-safe slug
+- `rewrite_host` — hostname whose absolute URLs should be rewritten to relative paths (e.g. `docs.docker.com`); pass `off` or `none` to disable rewriting
+- `source_ref` — optional label stored as the build's image ref (e.g. a git SHA)
 
-1. write site files to the configured storage backend
-2. register/update the preview in the database
-3. inject review client at serve-time
+**Chunked upload for large archives:**
+
+Archives larger than ~30 MiB should be split and uploaded in chunks:
+
+```bash
+split -d -a 4 -b 20971520 my-docs-review.tar.gz chunks/chunk-
+# then for each chunk (0-indexed):
+curl -X POST "http://localhost:8080/api/builds/upload?name=my-docs-review&chunk=0&chunks=3" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary "@chunks/chunk-0000"
+```
+
+The `publish-branch.sh` script handles chunking automatically.
+
+**Upload flow:**
+
+1. server assembles chunks (if applicable) and stores site files to the configured storage backend
+2. registers/updates the preview in the database
+3. injects the review client at serve-time
 
 Same preview name uploads overwrite preview files and metadata while preserving comments.
 
-Generated docs are available at:
+Generated docs are available at `http://localhost:8080/<tag>/`.
 
-- `http://localhost:8080/<tag>/`
+## API reference
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/builds` | List all builds with comment counts |
+| `POST` | `/api/builds/upload` | Upload a site archive (see above) |
+| `GET` | `/api/comments?build_id=<id>&page_path=<path>` | Fetch comments for a page |
+| `POST` | `/api/comments` | Create a comment |
+| `POST` | `/api/comments/<id>/resolve` | Resolve or unresolve a comment |
+| `POST` | `/api/comments/<id>/reply` | Reply to a comment |
+| `GET` | `/healthz` | Health check |
+
+## Soft-delete workflow
+
+Deleting a preview from the UI archives it rather than removing it immediately. Archived previews:
+
+- are hidden from the previews list
+- retain all comments
+- are permanently deleted after 7 days
+- can be restored within the 7-day window via the **Restore** button
+- can be permanently deleted immediately via the **Delete immediately** button
 
 ## Data model
 
@@ -139,27 +177,34 @@ Comment records include:
 - `line_start`, `line_end`, `selected_text`
 - `reviewer`, `resolved`, timestamps
 
+## Configuration
+
+All configuration is via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `8080` | HTTP listen port (Cloud Run sets this automatically) |
+| `REVIEW_BIND` | `0.0.0.0` | HTTP bind address |
+| `REVIEW_DATA_DIR` | `/app/data` | Root directory for site files and SQLite DB |
+| `REVIEW_LOCAL_CACHE_DIR` | `/app/review-cache` | Local cache dir (filesystem mode only) |
+| `REVIEW_SITE_STORAGE` | `filesystem` | Storage backend: `filesystem` or `gcs` |
+| `REVIEW_GCS_BUCKET` | — | GCS bucket name (gcs mode only) |
+| `REVIEW_GCS_PREFIX` | `docs-review` | Key prefix within the GCS bucket (gcs mode only) |
+| `REVIEW_DATABASE_URL` | — | Postgres connection string; if unset uses SQLite |
+| `REVIEW_DEFAULT_REVIEWER` | `anonymous` | Fallback reviewer name used when a comment is submitted via the API without a `reviewer` field |
+
 ## Persistence modes
 
-The service supports two persistence modes.
+**Local mode (default):**
 
-Local mode (default):
+- `REVIEW_SITE_STORAGE=filesystem`, `REVIEW_DATABASE_URL` unset
+- Site files stored under `REVIEW_DATA_DIR/builds/`
+- SQLite database at `REVIEW_DATA_DIR/review.db`
+- Backed by the Docker named volume `review_data` in `compose.yaml`
 
-- `REVIEW_SITE_STORAGE=filesystem`
-- `REVIEW_DATABASE_URL` unset
-- Uses `/app/data` (backed by the Docker volume in `compose.yaml`)
+**Cloud mode:**
 
-Cloud mode (durable):
-
-- `REVIEW_SITE_STORAGE=gcs`
-- `REVIEW_GCS_BUCKET=<your-bucket>`
-- `REVIEW_GCS_PREFIX=<optional-prefix>`
-- `REVIEW_DATABASE_URL=postgresql://...`
-
-In cloud mode:
-
-- site files are stored in GCS (durable object storage)
-- metadata/comments are stored in Postgres (Cloud SQL)
-
-This lets the same container run locally and in cloud environments with durable storage in both places.
+- `REVIEW_SITE_STORAGE=gcs` with `REVIEW_GCS_BUCKET` set
+- `REVIEW_DATABASE_URL` set to a Postgres connection string
+- Site files stored in GCS, metadata/comments in Postgres
 
