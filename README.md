@@ -112,12 +112,12 @@ curl -X POST "http://localhost:8080/api/builds/upload?name=my-docs-review&rewrit
 Upload flow:
 
 1. `POST /api/builds/upload?name=<name>[&rewrite_host=<host>]`
-2. server extracts and registers the preview
+2. server stores and registers the preview
 
 The app will:
 
-1. extract site files into `data/builds/<tag>/site`
-2. register/update the preview in `data/review.db`
+1. write site files to the configured storage backend
+2. register/update the preview in the database
 3. inject review client at serve-time
 
 Same preview name uploads overwrite preview files and metadata while preserving comments.

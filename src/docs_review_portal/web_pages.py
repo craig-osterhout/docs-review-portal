@@ -5,11 +5,15 @@ import html
 import io
 import re
 from http import HTTPStatus
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 from docs_review_portal.config import DEFAULT_REVIEWER
+import time
+
+from docs_review_portal import import_status
 from docs_review_portal.data import (
     create_comment,
+    delete_build_and_comments,
     fetch_build_comments_for_export,
     fetch_build_for_export,
     fetch_feedback,
@@ -19,7 +23,7 @@ from docs_review_portal.data import (
     set_comment_resolved,
 )
 from docs_review_portal.helpers import (
-    build_host,
+    build_path,
     build_url,
     compute_delete_at,
     format_ts,
@@ -56,6 +60,7 @@ class ReviewPagesMixin:
             action_path = f"/previews/{build_id}/delete"
             restore_path = f"/previews/{build_id}/restore"
             row_class = " class=\"is-archived\"" if archived_at is not None else ""
+            destroy_path = f"/previews/{build_id}/destroy"
             if archived_at is not None:
                 action_form = f"""
                     <form method="post" action="{restore_path}" onsubmit="return confirm('Restore this preview and keep it active?');">
@@ -63,6 +68,17 @@ class ReviewPagesMixin:
                         <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                           <path d="M3 12a9 9 0 1 0 3-6.7"></path>
                           <path d="M3 3v6h6"></path>
+                        </svg>
+                      </button>
+                    </form>
+                    <form method="post" action="{destroy_path}" onsubmit="return confirm('Permanently delete this preview and all comments right now? This cannot be undone.');">
+                      <button type="submit" class="icon-action icon-danger" title="Delete immediately" aria-label="Delete immediately">
+                        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                          <path d="M3 6h18"></path>
+                          <path d="M8 6V4h8v2"></path>
+                          <path d="M7 6l1 14h8l1-14"></path>
+                          <path d="M10 11v6"></path>
+                          <path d="M14 11v6"></path>
                         </svg>
                       </button>
                     </form>
@@ -86,8 +102,8 @@ class ReviewPagesMixin:
                 <tr{row_class}>
                   <td>{preview_display}</td>
                   <td>{format_ts(updated_at)}</td>
-                  <td><a href="{build_url(tag_raw)}" target="_blank" rel="noreferrer">View preview</a><br>
-                      <span class="subtle">{build_host(tag_raw)}</span></td>
+                  <td><a href="{build_url(tag_raw, base=self._public_base())}" target="_blank" rel="noreferrer">View preview</a><br>
+                      <span class="subtle">{urlparse(self._public_base()).netloc}{build_path(tag_raw)}</span></td>
                   <td><a href="/comments?build_id={build_id}">{open_comments} open / {comments} total</a></td>
                   <td>
                     <div class="preview-actions">
@@ -104,7 +120,36 @@ class ReviewPagesMixin:
                 </tr>
                 """
             )
-        build_table = "\n".join(build_rows) if build_rows else "<tr><td colspan='5'>No previews uploaded yet.</td></tr>"
+        pending = import_status.get_all()
+        now = time.time()
+
+        def _fmt_elapsed(started_at: float) -> str:
+            s = int(now - started_at)
+            return f"{s // 60}m {s % 60}s" if s >= 60 else f"{s}s"
+
+        pending_rows = []
+        for entry in pending:
+            name = html.escape(entry["display_name"])
+            tag_esc = html.escape(entry["tag"])
+            elapsed = _fmt_elapsed(entry["started_at"])
+            if entry["failed"]:
+                status_badge = '<span class="status archived">Failed</span>'
+                stage_text = html.escape(entry["error"]) if entry["error"] else "See logs for details"
+            else:
+                status_badge = '<span class="status open">Importing</span>'
+                stage_text = html.escape(entry["stage"])
+            pending_rows.append(f"""
+                <tr class="is-archived">
+                  <td><strong>{name}</strong><br><span class="subtle">{tag_esc}</span></td>
+                  <td>—</td>
+                  <td>{status_badge}<br><span class="subtle">{stage_text}</span></td>
+                  <td>—</td>
+                  <td><span class="subtle">{elapsed} elapsed</span></td>
+                </tr>""")
+
+        all_rows = pending_rows + build_rows
+        build_table = "\n".join(all_rows) if all_rows else "<tr><td colspan='5'>No previews uploaded yet.</td></tr>"
+        auto_refresh = 3 if any(not e["failed"] for e in pending) else None
 
         body = f"""
         <section class="panel">
@@ -127,7 +172,7 @@ class ReviewPagesMixin:
           </table>
         </section>
         """
-        self._send_html(HTTPStatus.OK, html_page("Previews", body))
+        self._send_html(HTTPStatus.OK, html_page("Previews", body, auto_refresh=auto_refresh))
 
     def _export_preview_comments_csv(self, path: str) -> None:
         match = re.match(r"^/(?:publications|previews)/(\d+)/comments\.csv$", path)
@@ -243,14 +288,14 @@ class ReviewPagesMixin:
             params["dir"] = next_dir
             arrow = ""
             if sort_key == column:
-                arrow = " (â†‘)" if sort_dir == "asc" else " (â†“)"
+                arrow = " (↑)" if sort_dir == "asc" else " (↓)"
             href = f"/comments?{urlencode(params)}"
             return f'<a href="{html.escape(href)}">{html.escape(label)}{arrow}</a>'
 
         comment_rows: list[str] = []
         for comment in comments:
             resolved_label = "resolved" if comment["resolved"] else "open"
-            location = build_url(str(comment["build_tag"]), str(comment["page_path"]))
+            location = build_url(str(comment["build_tag"]), str(comment["page_path"]), base=self._public_base())
             location = f"{location}#review-comment-{comment['id']}"
             archived_raw = comment.get("build_archived_at")
             archived_at = int(archived_raw) if archived_raw is not None else None
@@ -359,6 +404,14 @@ class ReviewPagesMixin:
             self.send_error(HTTPStatus.NOT_FOUND, "Action not found")
             return
         restore_archived_build(int(match.group(1)))
+        self._redirect("/previews")
+
+    def _destroy_preview(self, path: str) -> None:
+        match = re.match(r"^/(?:publications|previews)/(\d+)/destroy$", path)
+        if not match:
+            self.send_error(HTTPStatus.NOT_FOUND, "Action not found")
+            return
+        delete_build_and_comments(int(match.group(1)))
         self._redirect("/previews")
 
     def _feedback_toggle_resolved(self, path: str) -> None:

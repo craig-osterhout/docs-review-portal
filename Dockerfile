@@ -15,6 +15,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src ./src
 COPY static ./static
 RUN mkdir -p /app/data/builds
+ARG BUILD_VERSION=dev
+RUN echo "$BUILD_VERSION" > /app/BUILD_VERSION
 
 FROM dhi.io/python:3.12
 

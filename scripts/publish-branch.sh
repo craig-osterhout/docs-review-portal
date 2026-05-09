@@ -47,7 +47,6 @@ NAME="$(printf "%s" "$RAW_NAME" | tr "[:upper:]" "[:lower:]" | sed -E 's#[^a-z0-
 
 URL="${REVIEW_SERVICE_URL:-http://localhost:8080}"
 OUT_REL="tmp/review-site/$NAME"
-OUT="$DOCS_DIR/$OUT_REL"
 ARCHIVE_REL="tmp/review-site/$NAME.tar.gz"
 ARCHIVE="$DOCS_DIR/$ARCHIVE_REL"
 CHUNKS_REL="tmp/review-site/chunks-$NAME"
@@ -62,11 +61,13 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Build static site output to a local folder.
-rm -rf "$OUT"
-mkdir -p "$OUT" "$(dirname "$ARCHIVE")"
+rm -rf "$DOCS_DIR/$OUT_REL"
+mkdir -p "$DOCS_DIR/$OUT_REL" "$(dirname "$ARCHIVE")"
 (cd "$DOCS_DIR" && docker buildx bake release --set "release.output=type=local,dest=$OUT_REL")
+
 # Package the built site as a .tar.gz upload payload.
 (cd "$DOCS_DIR" && tar -C "$OUT_REL" -czf "$ARCHIVE_REL" .)
+
 # Upload archive — split into 20 MiB chunks if the archive exceeds the server body limit.
 ARCHIVE_BYTES="$(wc -c < "$ARCHIVE" | tr -d ' \t\n')"
 if [ "$ARCHIVE_BYTES" -gt "$CHUNK_SIZE" ]; then
@@ -75,17 +76,29 @@ if [ "$ARCHIVE_BYTES" -gt "$CHUNK_SIZE" ]; then
   TOTAL="$(ls "$CHUNKS_DIR"/chunk-* | wc -l | tr -d ' \t\n')"
   IDX=0
   for CHUNK in "$CHUNKS_DIR"/chunk-*; do
-    printf 'Uploading part %d/%d...\n' "$((IDX + 1))" "$TOTAL" >&2
-    (cd "$DOCS_DIR" && curl --fail --show-error --ssl-no-revoke -o /dev/null \
-      -X POST "$URL/api/builds/upload?name=$NAME&chunk=$IDX&chunks=$TOTAL&rewrite_host=$REWRITE_HOST" \
-      -H "Content-Type: application/octet-stream" \
-      --data-binary "@$CHUNK")
+    IDX_HUMAN="$((IDX + 1))"
+    printf 'Uploading part %d/%d...\n' "$IDX_HUMAN" "$TOTAL" >&2
+    if [ "$IDX_HUMAN" -lt "$TOTAL" ]; then
+      (cd "$DOCS_DIR" && curl --fail --show-error --ssl-no-revoke -o /dev/null \
+        -X POST "$URL/api/builds/upload?name=$NAME&chunk=$IDX&chunks=$TOTAL&rewrite_host=$REWRITE_HOST" \
+        -H "Content-Type: application/octet-stream" \
+        --data-binary "@$CHUNK")
+    else
+      # Last chunk — server streams import progress until complete.
+      printf 'Processing on server...\n' >&2
+      (cd "$DOCS_DIR" && curl --fail --show-error --ssl-no-revoke --no-buffer \
+        -X POST "$URL/api/builds/upload?name=$NAME&chunk=$IDX&chunks=$TOTAL&rewrite_host=$REWRITE_HOST" \
+        -H "Content-Type: application/octet-stream" \
+        --data-binary "@$CHUNK")
+    fi
     IDX=$((IDX + 1))
   done
 else
-  (cd "$DOCS_DIR" && curl --fail --show-error --ssl-no-revoke -o /dev/null \
+  # Single upload — server streams import progress until complete.
+  printf 'Processing on server...\n' >&2
+  (cd "$DOCS_DIR" && curl --fail --show-error --ssl-no-revoke --no-buffer \
     -X POST "$URL/api/builds/upload?name=$NAME&rewrite_host=$REWRITE_HOST" \
     -H "Content-Type: application/gzip" \
     --data-binary "@$ARCHIVE_REL")
 fi
-echo "Submitted."
+echo "Done."

@@ -179,17 +179,19 @@ def build_host(tag: str) -> str:
     return f"localhost:{PUBLIC_PORT}{build_path(tag)}"
 
 
-def build_url(tag: str, path: str = "/") -> str:
-    return f"http://localhost:{PUBLIC_PORT}{build_path(tag, path)}"
+def build_url(tag: str, path: str = "/", base: str | None = None) -> str:
+    root = base.rstrip("/") if base else f"http://localhost:{PUBLIC_PORT}"
+    return f"{root}{build_path(tag, path)}"
 
 
-def html_page(title: str, body: str) -> str:
+def html_page(title: str, body: str, auto_refresh: int | None = None) -> str:
+    refresh = f'  <meta http-equiv="refresh" content="{auto_refresh}">\n' if auto_refresh else ""
     return f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{html.escape(title)}</title>
+{refresh}  <title>{html.escape(title)}</title>
   <link rel="stylesheet" href="/_review/assets/app.css">
 </head>
 <body>

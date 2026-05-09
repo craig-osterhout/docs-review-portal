@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shutil
 import tempfile
 import threading
+import time
 from http import HTTPStatus
 from pathlib import Path
 
 _log = logging.getLogger(__name__)
+
+
+def _stage_callback(tag: str, stage: str) -> None:
+    import_status.update(tag, stage)
+    _log.info("import %r: %s", tag, stage)
 
 
 def _run_import(
@@ -19,6 +26,7 @@ def _run_import(
     source_ref: str | None,
     rewrite_host: str,
 ) -> None:
+    import_status.update(tag, "Starting import")
     _log.info("import started for %r (archive: %s, size: %d bytes)", tag, archive_path, archive_path.stat().st_size)
     try:
         result = import_build_archive_path(
@@ -27,11 +35,13 @@ def _run_import(
             display_name=display_name,
             source_ref=source_ref,
             rewrite_host=rewrite_host,
-            stage_callback=lambda stage: _log.info("import %r: %s", tag, stage),
+            stage_callback=lambda stage: _stage_callback(tag, stage),
         )
         _log.info("import complete for %r (build_id: %d)", tag, result.build_id)
+        import_status.complete(tag)
     except Exception as exc:
         _log.error("import failed for %r: %s", tag, exc, exc_info=True)
+        import_status.fail(tag, str(exc))
     finally:
         if staging_dir is not None:
             shutil.rmtree(staging_dir, ignore_errors=True)
@@ -40,7 +50,7 @@ def _run_import(
 
 import html as _html
 
-from docs_review_portal import log_buffer
+from docs_review_portal import import_status, log_buffer
 from docs_review_portal.config import (
     DEFAULT_REVIEWER,
     DEFAULT_REWRITE_HOST,
@@ -63,6 +73,7 @@ from docs_review_portal.helpers import (
     format_ts,
     slugify_tag,
 )
+
 
 
 class ReviewApiMixin:
@@ -88,7 +99,7 @@ class ReviewApiMixin:
                         if row["archived_at"] is not None
                         else None
                     ),
-                    "site_url": build_url(str(row["tag"])),
+                    "site_url": build_url(str(row["tag"]), base=self._public_base()),
                 }
                 for row in rows
             ]
@@ -140,6 +151,11 @@ class ReviewApiMixin:
                 )
                 return
 
+            if chunk_idx == 0:
+                import_status.start(tag, display_name, f"Uploading (1/{total_chunks})")
+            else:
+                import_status.update(tag, f"Uploading ({chunk_idx + 1}/{total_chunks})")
+
             staging_dir = Path(tempfile.gettempdir()) / f"review-upload-{tag}"
             staging_dir.mkdir(exist_ok=True)
 
@@ -181,6 +197,7 @@ class ReviewApiMixin:
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"failed to assemble chunks: {exc}"})
                 return
         else:
+            import_status.start(tag, display_name, "Uploading")
             try:
                 archive_path = self._read_body_to_temp_file()
             except Exception as exc:
@@ -189,21 +206,39 @@ class ReviewApiMixin:
 
         source_ref = (query.get("source_ref", [""])[0] or "").strip() or None
 
-        threading.Thread(
+        # Run import in a background thread so health checks stay responsive, but
+        # keep this request connection open with streaming progress so Cloud Run
+        # allocates full CPU for the duration.
+        t = threading.Thread(
             target=_run_import,
             args=(archive_path, staging_dir, tag, display_name, source_ref, rewrite_host),
             daemon=True,
-        ).start()
+        )
+        t.start()
 
-        self._send_json(
-            HTTPStatus.ACCEPTED,
-            {
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+        while t.is_alive():
+            entries = import_status.get_all()
+            stage = next((e["stage"] for e in entries if e["tag"] == tag), "working")
+            self._write_chunk(f"status: {stage}\n".encode())
+            t.join(timeout=2)
+
+        failed = import_status.get_failed(tag)
+        if failed:
+            self._write_chunk(f"error: {failed['error']}\n".encode())
+        else:
+            result = json.dumps({
                 "tag": tag,
                 "name": display_name,
                 "rewrite_host": rewrite_host or None,
-                "site_url": build_url(tag),
-            },
-        )
+                "site_url": build_url(tag, base=self._public_base()),
+            })
+            self._write_chunk(f"result: {result}\n".encode())
+        self._write_chunk(b"")
 
     def _api_get_comments(self, query: dict[str, list[str]]) -> None:
         build_raw = query.get("build_id", [""])[0]
@@ -266,29 +301,36 @@ class ReviewApiMixin:
 
     def _render_logs_page(self) -> None:
         entries = log_buffer.get_entries()
+        level_class = {"ERROR": "archived", "WARNING": "open", "INFO": "resolved"}
         rows = "".join(
-            f"<tr class='lvl-{e['level'].lower()}'>"
+            f"<tr>"
             f"<td>{_html.escape(e['ts_human'])}</td>"
-            f"<td>{_html.escape(e['level'])}</td>"
+            f"<td><span class=\"status {level_class.get(e['level'], '')}\">{_html.escape(e['level'])}</span></td>"
             f"<td>{_html.escape(e['logger'])}</td>"
-            f"<td>{_html.escape(e['msg'])}</td>"
+            f"<td><code>{_html.escape(e['msg'])}</code></td>"
             f"</tr>"
             for e in reversed(entries)
         )
         body = f"""
-<h1>Logs <small>({len(entries)} entries)</small></h1>
-<p><a href='/logs'>Refresh</a></p>
-<style>
-table{{width:100%;border-collapse:collapse;font-size:.85em;font-family:monospace}}
-th,td{{padding:4px 8px;border:1px solid #ddd;text-align:left;vertical-align:top}}
-th{{background:#f4f4f4}}
-.lvl-error td{{background:#fff0f0}}
-.lvl-warning td{{background:#fffbe6}}
-</style>
-<table>
-<thead><tr><th>Time</th><th>Level</th><th>Logger</th><th>Message</th></tr></thead>
-<tbody>{rows or '<tr><td colspan=4>No log entries yet.</td></tr>'}</tbody>
-</table>"""
+        <section class="panel">
+          <h1>Logs</h1>
+          <p><a href="/logs">Refresh</a></p>
+        </section>
+        <section class="panel">
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Level</th>
+                <th>Logger</th>
+                <th>Message</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows or '<tr><td colspan="4">No log entries yet.</td></tr>'}
+            </tbody>
+          </table>
+        </section>"""
         from docs_review_portal.helpers import html_page
         self._send_html(HTTPStatus.OK, html_page("Logs", body))
 

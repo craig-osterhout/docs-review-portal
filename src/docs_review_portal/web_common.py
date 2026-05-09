@@ -8,10 +8,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs
 
+from docs_review_portal.config import PUBLIC_PORT
 from docs_review_portal.helpers import html_page
 
 
 class ReviewCommonMixin:
+    def _public_base(self) -> str:
+        host = self.headers.get("Host") or f"localhost:{PUBLIC_PORT}"
+        scheme = self.headers.get("X-Forwarded-Proto") or ("https" if "443" in host else "http")
+        return f"{scheme}://{host}"
     def _handle_exception(self, exc: Exception) -> None:
         if self.path.startswith("/api/"):
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
@@ -43,6 +48,12 @@ class ReviewCommonMixin:
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _write_chunk(self, data: bytes) -> None:
+        self.wfile.write(f"{len(data):x}\r\n".encode())
+        self.wfile.write(data)
+        self.wfile.write(b"\r\n")
+        self.wfile.flush()
 
     def _redirect(self, location: str, status: HTTPStatus = HTTPStatus.SEE_OTHER) -> None:
         self.send_response(status)

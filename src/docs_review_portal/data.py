@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import json
+import logging as _logging
 import mimetypes
 import re
 import shutil
 import sqlite3
 import tarfile
 import tempfile
+import threading as _threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 from docs_review_portal.config import (
     BUILDS_DIR,
+    LOCAL_CACHE_DIR,
     DATABASE_URL,
     DB_BACKEND,
     DB_PATH,
@@ -94,7 +97,7 @@ class SiteStore:
     def rollback_replace(self, tag: str, had_existing_site: bool) -> None:
         raise NotImplementedError
 
-    def replace_site_from_archive(self, archive_path: Path, tag: str) -> None:
+    def replace_site_from_archive(self, archive_path: Path, tag: str, progress_callback: Callable[[int, int], None] | None = None) -> None:
         raise NotImplementedError
 
     def read_file(self, tag: str, rel_path: str) -> bytes | None:
@@ -118,27 +121,97 @@ class FilesystemSiteStore(SiteStore):
         self._builds_root.mkdir(parents=True, exist_ok=True)
 
     def begin_replace(self, tag: str) -> bool:
+        import threading
+        import time as _time
         site_dir = self._site_dir(tag, "site")
-        previous_site_dir = self._site_dir(tag, PREVIOUS_SITE_DIRNAME)
         self._build_dir(tag).mkdir(parents=True, exist_ok=True)
 
         had_existing_site = site_dir.exists()
         if had_existing_site:
-            if previous_site_dir.exists():
-                shutil.rmtree(previous_site_dir)
-            site_dir.rename(previous_site_dir)
+            # Rename to a temp name then delete in a background thread so we
+            # don't block the import on a slow GCS FUSE directory walk.
+            tmp_dir = self._build_dir(tag) / f"_deleting_{int(_time.time())}"
+            try:
+                site_dir.rename(tmp_dir)
+                threading.Thread(
+                    target=lambda: shutil.rmtree(tmp_dir, ignore_errors=True),
+                    daemon=True,
+                ).start()
+            except OSError:
+                # GCS FUSE rename fails with ENFILE — delete in background too.
+                threading.Thread(
+                    target=lambda d=site_dir: shutil.rmtree(d, ignore_errors=True),
+                    daemon=True,
+                ).start()
         return had_existing_site
 
     def rollback_replace(self, tag: str, had_existing_site: bool) -> None:
         site_dir = self._site_dir(tag, "site")
         previous_site_dir = self._site_dir(tag, PREVIOUS_SITE_DIRNAME)
         if site_dir.exists():
-            shutil.rmtree(site_dir, ignore_errors=True)
+            _rmtree_parallel(site_dir)
         if had_existing_site and previous_site_dir.exists():
-            previous_site_dir.rename(site_dir)
+            try:
+                previous_site_dir.rename(site_dir)
+            except OSError:
+                _rmtree_parallel(previous_site_dir)
 
-    def replace_site_from_archive(self, archive_path: Path, tag: str) -> None:
-        extract_site_archive(archive_path, self._site_dir(tag, "site"))
+    def replace_site_from_archive(self, archive_path: Path, tag: str, progress_callback: Callable[[int, int], None] | None = None) -> None:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import logging
+        import threading
+
+        _log = logging.getLogger(__name__)
+        dest = self._site_dir(tag, "site")
+        dest.mkdir(parents=True, exist_ok=True)
+
+        # Count files first (fast — no extraction)
+        total = sum(1 for m in tarfile.open(archive_path, mode="r:*").getmembers() if m.isreg())
+        _log.info("replace_site_from_archive %r: writing %d files in parallel to %s", tag, total, dest)
+
+        completed = [0]
+        counter_lock = threading.Lock()
+        # Semaphore limits how many file payloads are in memory simultaneously.
+        sem = threading.Semaphore(64)
+
+        def _write(target: Path, data: bytes) -> None:
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+                if progress_callback:
+                    with counter_lock:
+                        completed[0] += 1
+                        n = completed[0]
+                    if n % 50 == 0 or n == total:
+                        progress_callback(n, total)
+            finally:
+                sem.release()
+
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            futures = []
+            with tarfile.open(archive_path, mode="r:*") as archive:
+                for member in archive.getmembers():
+                    rel = Path(member.name)
+                    parts = [part for part in rel.parts if part not in ("", ".")]
+                    if not parts or ".." in parts:
+                        continue
+                    rel = Path(*parts)
+                    target = _safe_target(dest, rel)
+                    if target is None:
+                        continue
+                    if member.isdir():
+                        target.mkdir(parents=True, exist_ok=True)
+                        continue
+                    if member.isreg():
+                        src = archive.extractfile(member)
+                        if src is None:
+                            continue
+                        data = src.read()
+                        sem.acquire()
+                        futures.append(pool.submit(_write, target, data))
+            for f in as_completed(futures):
+                f.result()
+        _log.info("replace_site_from_archive %r: done", tag)
 
     def read_file(self, tag: str, rel_path: str) -> bytes | None:
         site_root = self._site_dir(tag, "site").resolve()
@@ -217,8 +290,13 @@ class GCSSiteStore(SiteStore):
         if had_existing_site and self._has_prefix(previous_prefix):
             self._copy_prefix(previous_prefix, site_prefix)
 
-    def replace_site_from_archive(self, archive_path: Path, tag: str) -> None:
+    def replace_site_from_archive(self, archive_path: Path, tag: str, progress_callback: Callable[[int, int], None] | None = None) -> None:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+
         site_prefix = self._snapshot_prefix(tag, "site")
+
+        uploads: list[tuple[str, bytes, str]] = []
         with tarfile.open(archive_path, mode="r:*") as archive:
             for member in archive.getmembers():
                 if not member.isreg():
@@ -232,8 +310,25 @@ class GCSSiteStore(SiteStore):
                 if src is None:
                     continue
                 ctype = mimetypes.guess_type(rel_str)[0] or "application/octet-stream"
-                blob = self._bucket.blob(f"{site_prefix}{rel_str}")
-                blob.upload_from_string(src.read(), content_type=ctype)
+                uploads.append((f"{site_prefix}{rel_str}", src.read(), ctype))
+
+        total = len(uploads)
+        completed = [0]
+        counter_lock = threading.Lock()
+
+        def _upload(blob_name: str, data: bytes, content_type: str) -> None:
+            self._bucket.blob(blob_name).upload_from_string(data, content_type=content_type)
+            if progress_callback:
+                with counter_lock:
+                    completed[0] += 1
+                    n = completed[0]
+                if n % 50 == 0 or n == total:
+                    progress_callback(n, total)
+
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            futures = {pool.submit(_upload, *u): u[0] for u in uploads}
+            for f in as_completed(futures):
+                f.result()
 
     def read_file(self, tag: str, rel_path: str) -> bytes | None:
         blob = self._bucket.blob(f"{self._snapshot_prefix(tag, 'site')}{rel_path}")
@@ -246,9 +341,116 @@ class GCSSiteStore(SiteStore):
         self._delete_prefix(self._prefix_with_root(f"builds/{tag}/"))
 
 
+class LocalCacheSiteStore(SiteStore):
+    def __init__(self, local_dir: Path, backing_dir: Path) -> None:
+        self._local = local_dir      # container-local disk — fast r/w
+        self._backing = backing_dir  # GCS FUSE — scanned at startup to recover any legacy tar backups
+        self._log = _logging.getLogger(__name__)
+
+    def _site_dir(self, tag: str) -> Path:
+        return self._local / tag / "site"
+
+    def _prev_dir(self, tag: str) -> Path:
+        return self._local / tag / PREVIOUS_SITE_DIRNAME
+
+
+    def init_storage(self) -> None:
+        self._local.mkdir(parents=True, exist_ok=True)
+        # GCS FUSE recovery disabled while testing container-local serving.
+        # Uncomment to restore restart recovery from tar backups on GCS FUSE.
+        # self._backing.mkdir(parents=True, exist_ok=True)
+        # try:
+        #     to_recover = [
+        #         (tag_dir.name, tag_dir / "site.tar.gz")
+        #         for tag_dir in self._backing.iterdir()
+        #         if tag_dir.is_dir()
+        #         and (tag_dir / "site.tar.gz").exists()
+        #         and not self._site_dir(tag_dir.name).exists()
+        #     ]
+        # except Exception as exc:
+        #     self._log.error("init recovery scan failed: %s", exc)
+        #     return
+        # if to_recover:
+        #     self._log.info("scheduling sequential recovery of %d build(s)", len(to_recover))
+        #     _threading.Thread(target=self._recover_all, args=(to_recover,), daemon=True).start()
+
+    def _recover_all(self, builds: list[tuple[str, Path]]) -> None:
+        for tag, tar_path in builds:
+            try:
+                self._log.info("recovering %r from archive...", tag)
+                extract_site_archive(tar_path, self._site_dir(tag))
+                self._log.info("recovered %r", tag)
+            except Exception as exc:
+                self._log.error("recovery of %r failed: %s", tag, exc)
+
+    def begin_replace(self, tag: str) -> bool:
+        site = self._site_dir(tag)
+        prev = self._prev_dir(tag)
+        (self._local / tag).mkdir(parents=True, exist_ok=True)
+        had = site.exists()
+        if had:
+            if prev.exists():
+                shutil.rmtree(prev, ignore_errors=True)
+            site.rename(prev)  # local FS rename — fast, no ENFILE
+        return had
+
+    def rollback_replace(self, tag: str, had_existing_site: bool) -> None:
+        site = self._site_dir(tag)
+        prev = self._prev_dir(tag)
+        if site.exists():
+            shutil.rmtree(site, ignore_errors=True)
+        if had_existing_site and prev.exists():
+            prev.rename(site)
+
+    def replace_site_from_archive(self, archive_path: Path, tag: str, progress_callback: Callable[[int, int], None] | None = None) -> None:
+        dest = self._backing / tag / "site"
+        fuse = _parse_fuse_mount(self._backing)
+        if fuse:
+            bucket, mount_point = fuse
+            gcs_prefix = dest.relative_to(mount_point).as_posix()
+            self._log.info("uploading %r to gs://%s/%s/ via GCS SDK...", tag, bucket, gcs_prefix)
+            _upload_archive_to_gcs(archive_path, bucket, gcs_prefix, self._log)
+        else:
+            self._log.info("extracting %r to local backing store...", tag)
+            extract_site_archive(archive_path, dest)
+            self._log.info("extracted %r to local backing store", tag)
+
+    def read_file(self, tag: str, rel_path: str) -> bytes | None:
+        # Check FUSE backing store first (tar imports and direct GCS uploads land here).
+        backing_root = (self._backing / tag / "site").resolve()
+        backing_path = (backing_root / rel_path.lstrip("/")).resolve()
+        try:
+            backing_path.relative_to(backing_root)
+        except ValueError:
+            return None
+        if backing_path.is_file():
+            return backing_path.read_bytes()
+        # Fall back to local cache for any build extracted there previously.
+        site_root = self._site_dir(tag).resolve()
+        path = (site_root / rel_path.lstrip("/")).resolve()
+        try:
+            path.relative_to(site_root)
+        except ValueError:
+            return None
+        if not path.is_file():
+            return None
+        return path.read_bytes()
+
+    def delete_build(self, tag: str) -> None:
+        local_dir = self._local / tag
+        if local_dir.exists():
+            shutil.rmtree(local_dir, ignore_errors=True)
+        backing_dir = self._backing / tag
+        if backing_dir.exists():
+            _threading.Thread(
+                target=lambda: shutil.rmtree(backing_dir, ignore_errors=True),
+                daemon=True,
+            ).start()
+
+
 def create_site_store() -> SiteStore:
     if SITE_STORAGE_BACKEND == "filesystem":
-        return FilesystemSiteStore(BUILDS_DIR)
+        return LocalCacheSiteStore(LOCAL_CACHE_DIR, BUILDS_DIR)
     if SITE_STORAGE_BACKEND == "gcs":
         return GCSSiteStore(GCS_BUCKET, GCS_PREFIX)
     raise ValueError(
@@ -374,14 +576,115 @@ def _remove_path(path: Path) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def _rmtree_parallel(path: Path, max_workers: int = 32) -> None:
+    """Delete a directory tree using a thread pool — fast on GCS FUSE mounts."""
+    from concurrent.futures import ThreadPoolExecutor
+    if not path.exists():
+        return
+    files = [p for p in path.rglob("*") if p.is_file() or p.is_symlink()]
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(lambda p=p: p.unlink(missing_ok=True)) for p in files]
+        for f in futures:
+            try:
+                f.result()
+            except Exception:
+                pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
+
+def _parse_fuse_mount(path: Path) -> tuple[str, str] | None:
+    """Return (bucket, mount_point) if path is under a GCS FUSE mount, else None."""
+    try:
+        mounts_text = Path("/proc/mounts").read_text()
+        best: tuple[int, str, str] = (0, "", "")
+        for line in mounts_text.splitlines():
+            parts = line.split()
+            if len(parts) < 3 or parts[2] != "fuse.gcsfuse":
+                continue
+            device, mount_point = parts[0], parts[1]
+            bucket = device[len("gcsfuse#"):] if device.startswith("gcsfuse#") else device
+            if not bucket:
+                continue
+            try:
+                path.relative_to(mount_point)
+                if len(mount_point) > best[0]:
+                    best = (len(mount_point), bucket, mount_point)
+            except ValueError:
+                continue
+        return (best[1], best[2]) if best[1] else None
+    except Exception:
+        return None
+
+
+def _upload_archive_to_gcs(
+    archive_path: Path,
+    bucket_name: str,
+    gcs_prefix: str,
+    log: _logging.Logger,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    try:
+        from google.cloud import storage as _gcs
+    except ImportError as exc:
+        raise RuntimeError("google-cloud-storage is required for GCS uploads") from exc
+
+    client = _gcs.Client()
+    bucket = client.bucket(bucket_name)
+
+    existing = list(bucket.list_blobs(prefix=f"{gcs_prefix}/"))
+    if existing:
+        log.info("deleting %d existing objects at gs://%s/%s/", len(existing), bucket_name, gcs_prefix)
+        bucket.delete_blobs(existing)
+
+    sem = _threading.Semaphore(64)
+    uploaded = [0]
+    counter_lock = _threading.Lock()
+
+    def _upload(blob_name: str, data: bytes, content_type: str) -> None:
+        try:
+            bucket.blob(blob_name).upload_from_string(data, content_type=content_type)
+            with counter_lock:
+                uploaded[0] += 1
+        finally:
+            sem.release()
+
+    futures = []
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        with tarfile.open(archive_path, mode="r|gz") as archive:
+            for member in archive:
+                if not member.isreg():
+                    continue
+                rel = Path(member.name)
+                parts = [p for p in rel.parts if p not in ("", ".")]
+                if not parts or ".." in parts:
+                    continue
+                rel_str = Path(*parts).as_posix()
+                src = archive.extractfile(member)
+                if src is None:
+                    continue
+                data = src.read()
+                content_type = mimetypes.guess_type(rel_str)[0] or "application/octet-stream"
+                sem.acquire()
+                futures.append(pool.submit(_upload, f"{gcs_prefix}/{rel_str}", data, content_type))
+
+    for f in futures:
+        f.result()
+
+    log.info("uploaded %d objects to gs://%s/%s/", uploaded[0], bucket_name, gcs_prefix)
+
 
 def extract_site_archive(archive_path: Path, destination: Path) -> None:
+    import time as _time
     if destination.exists():
         shutil.rmtree(destination)
     destination.mkdir(parents=True, exist_ok=True)
 
-    with tarfile.open(archive_path, mode="r:*") as archive:
-        for member in archive.getmembers():
+    # r|gz streaming mode: single decompression pass (r:gz decompresses twice —
+    # once for getmembers(), again for each extractfile() call).
+    with tarfile.open(archive_path, mode="r|gz") as archive:
+        for i, member in enumerate(archive):
             rel = Path(member.name)
             parts = [part for part in rel.parts if part not in ("", ".")]
             if not parts or ".." in parts:
@@ -393,27 +696,25 @@ def extract_site_archive(archive_path: Path, destination: Path) -> None:
 
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
-                continue
-
-            if member.isreg():
+            elif member.isreg():
                 target.parent.mkdir(parents=True, exist_ok=True)
                 src = archive.extractfile(member)
-                if src is None:
-                    continue
-                with src, target.open("wb") as out:
-                    shutil.copyfileobj(src, out)
-                continue
-
-            if member.issym():
+                if src is not None:
+                    with src, target.open("wb") as out:
+                        shutil.copyfileobj(src, out)
+            elif member.issym():
                 link_target = Path(member.linkname)
-                if link_target.is_absolute() or ".." in link_target.parts:
-                    continue
-                target.parent.mkdir(parents=True, exist_ok=True)
-                _remove_path(target)
-                try:
-                    target.symlink_to(member.linkname)
-                except OSError:
-                    pass
+                if not (link_target.is_absolute() or ".." in link_target.parts):
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    _remove_path(target)
+                    try:
+                        target.symlink_to(member.linkname)
+                    except OSError:
+                        pass
+
+            # Yield GIL every 50 members so HTTP handler threads stay responsive.
+            if i % 50 == 0:
+                _time.sleep(0)
 
 
 def import_build_archive_path(
@@ -434,8 +735,13 @@ def import_build_archive_path(
 
     if stage_callback:
         stage_callback("Extracting preview files")
+
+    def _progress(n: int, total: int) -> None:
+        if stage_callback:
+            stage_callback(f"Importing file {n} of {total}")
+
     try:
-        SITE_STORE.replace_site_from_archive(archive_path, resolved_tag)
+        SITE_STORE.replace_site_from_archive(archive_path, resolved_tag, progress_callback=_progress if stage_callback else None)
     except Exception:
         SITE_STORE.rollback_replace(resolved_tag, had_existing_site)
         raise

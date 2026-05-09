@@ -18,8 +18,11 @@ def normalize_rewrite_host(value: str | None) -> str | None:
 
 SOURCE_ROOT = Path(__file__).resolve().parent.parent
 APP_ROOT = SOURCE_ROOT.parent
+_ver_file = APP_ROOT / "BUILD_VERSION"
+BUILD_VERSION = _ver_file.read_text().strip() if _ver_file.exists() else "dev"
 DATA_DIR = Path(os.environ.get("REVIEW_DATA_DIR", APP_ROOT / "data")).resolve()
 BUILDS_DIR = DATA_DIR / "builds"
+LOCAL_CACHE_DIR = Path(os.environ.get("REVIEW_LOCAL_CACHE_DIR", "/app/review-cache")).resolve()
 DB_PATH = DATA_DIR / "review.db"
 STATIC_DIR = APP_ROOT / "static"
 DATABASE_URL = (os.environ.get("REVIEW_DATABASE_URL") or "").strip()

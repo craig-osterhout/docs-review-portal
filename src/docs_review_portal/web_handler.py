@@ -104,6 +104,9 @@ class ReviewHandler(
         if (path.startswith("/publications/") or path.startswith("/previews/")) and path.endswith("/delete"):
             self._delete_preview(path)
             return
+        if (path.startswith("/publications/") or path.startswith("/previews/")) and path.endswith("/destroy"):
+            self._destroy_preview(path)
+            return
         if (path.startswith("/publications/") or path.startswith("/previews/")) and path.endswith("/restore"):
             self._restore_preview(path)
             return
@@ -131,9 +134,9 @@ class ReviewHandler(
 def serve() -> None:
     log_buffer.setup()
     import logging
-    from docs_review_portal.config import DATA_DIR, DB_BACKEND, SITE_STORAGE_BACKEND
+    from docs_review_portal.config import BUILD_VERSION, DATA_DIR, DB_BACKEND, SITE_STORAGE_BACKEND
     logging.getLogger(__name__).info(
-        "starting: storage=%s data_dir=%s db=%s", SITE_STORAGE_BACKEND, DATA_DIR, DB_BACKEND
+        "starting: version=%s storage=%s data_dir=%s db=%s", BUILD_VERSION, SITE_STORAGE_BACKEND, DATA_DIR, DB_BACKEND
     )
     init_storage()
     try:
