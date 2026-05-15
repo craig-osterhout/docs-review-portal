@@ -65,6 +65,22 @@ rm -rf "$DOCS_DIR/$OUT_REL"
 mkdir -p "$DOCS_DIR/$OUT_REL" "$(dirname "$ARCHIVE")"
 (cd "$DOCS_DIR" && docker buildx bake release --set "release.output=type=local,dest=$OUT_REL")
 
+# Generate .changed-pages list: URL paths for files added/modified vs origin/main.
+# Only runs when a content/ directory and a git repo are present.
+if [ -d "$DOCS_DIR/content" ] && git -C "$DOCS_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+  printf 'Detecting changed pages...\n' >&2
+  git -C "$DOCS_DIR" diff origin/main...HEAD --name-only --diff-filter=ACM -- content/ \
+    | sed 's|^content||; s|/_index\.md$|/|; s|/index\.md$|/|; s|\.md$|/|; s|^/manuals/|/|' \
+    | sort -u > "$DOCS_DIR/$OUT_REL/.changed-pages"
+  CHANGED_COUNT="$(wc -l < "$DOCS_DIR/$OUT_REL/.changed-pages" | tr -d ' \t\n')"
+  if [ "$CHANGED_COUNT" -eq 0 ]; then
+    rm -f "$DOCS_DIR/$OUT_REL/.changed-pages"
+    printf 'No changed pages detected (no diff against origin/main).\n' >&2
+  else
+    printf 'Found %s changed page(s).\n' "$CHANGED_COUNT" >&2
+  fi
+fi
+
 # Package the built site as a .tar.gz upload payload.
 (cd "$DOCS_DIR" && tar -C "$OUT_REL" -czf "$ARCHIVE_REL" .)
 

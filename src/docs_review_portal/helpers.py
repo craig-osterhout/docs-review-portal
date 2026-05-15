@@ -147,11 +147,12 @@ def rewrite_docs_domain_urls(
     return content
 
 
-def inject_review_bundle_html(content: str, build_id: int, tag: str, page_path: str) -> str:
+def inject_review_bundle_html(content: str, build_id: int, tag: str, page_path: str, changed_pages: list[str] | None = None) -> str:
     context = {
         "buildId": build_id,
         "buildTag": tag,
         "pagePath": page_path,
+        "changedPages": changed_pages or [],
     }
     inject = (
         f"{INJECT_START}\n"

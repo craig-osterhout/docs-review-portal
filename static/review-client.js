@@ -24,6 +24,8 @@
   let reviewerHelp = null;
   let pendingReviewerAction = null;
   let reviewerBadge = null;
+  let changedPagesSection = null;
+  let changedPagesVisible = false;
 
   assignLineNumbers();
   panel = createPanel();
@@ -406,6 +408,12 @@
         <div class="review-panel-head">
           <h2>Comments</h2>
           <div class="review-panel-head-actions">
+            ${ctx.changedPages && ctx.changedPages.length ? `<button type="button" class="review-icon-button" id="review-changed-pages-btn" title="Changed pages" aria-label="Changed pages">
+              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M8 6h13"></path><path d="M8 12h13"></path><path d="M8 18h13"></path>
+                <path d="M3 6h.01"></path><path d="M3 12h.01"></path><path d="M3 18h.01"></path>
+              </svg>
+            </button>` : ""}
             <a class="review-icon-button" id="review-view-all-comments" href="/comments?build_id=${encodeURIComponent(String(ctx.buildId))}" target="_blank" rel="noreferrer" title="View all comments" aria-label="View all comments">
               <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                 <path d="M21 12a8.5 8.5 0 0 1-8.5 8.5H6l-3 3v-6.5A8.5 8.5 0 1 1 21 12z"></path>
@@ -438,6 +446,7 @@
           </div>
           <span class="review-current-reviewer" id="review-current-reviewer">Reviewer: not set</span>
         </div>
+        <div id="review-changed-pages-section" hidden></div>
         <div class="review-comment-hint">Highlight text on the page to add comments.</div>
         <div id="review-panel-body">Loading...</div>
       </div>
@@ -488,8 +497,49 @@
       });
     }
 
+    changedPagesSection = aside.querySelector("#review-changed-pages-section");
+    if (changedPagesSection && ctx.changedPages && ctx.changedPages.length) {
+      var countEl = document.createElement("div");
+      countEl.className = "review-changed-pages-count";
+      countEl.textContent = ctx.changedPages.length + " changed page" + (ctx.changedPages.length !== 1 ? "s" : "");
+      changedPagesSection.appendChild(countEl);
+      var list = document.createElement("ul");
+      list.className = "review-changed-pages-list";
+      ctx.changedPages.forEach(function (path) {
+        var isCurrent = path === ctx.pagePath;
+        var li = document.createElement("li");
+        if (isCurrent) { li.className = "is-current"; }
+        var a = document.createElement("a");
+        a.href = "/" + ctx.buildTag + path;
+        a.textContent = path;
+        li.appendChild(a);
+        if (isCurrent) {
+          var badge = document.createElement("span");
+          badge.className = "review-current-page-badge";
+          badge.textContent = "current";
+          li.appendChild(badge);
+        }
+        list.appendChild(li);
+      });
+      changedPagesSection.appendChild(list);
+    }
+
+    var changedPagesBtn = aside.querySelector("#review-changed-pages-btn");
+    if (changedPagesBtn) {
+      changedPagesBtn.addEventListener("click", toggleChangedPagesView);
+    }
+
     setPanelVisible(true);
     return aside;
+  }
+
+  function toggleChangedPagesView() {
+    changedPagesVisible = !changedPagesVisible;
+    if (changedPagesSection) {
+      changedPagesSection.hidden = !changedPagesVisible;
+    }
+    var btn = panel && panel.querySelector("#review-changed-pages-btn");
+    if (btn) { btn.classList.toggle("is-active", changedPagesVisible); }
   }
 
   function onViewportChanged() {

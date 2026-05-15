@@ -65,6 +65,9 @@ class ReviewHandler(
         if re.match(r"^/(?:publications|previews)/\d+/comments\.csv$", path):
             self._export_preview_comments_csv(path)
             return
+        if re.match(r"^/(?:publications|previews)/\d+/changed-pages$", path):
+            self._render_changed_pages_page(path)
+            return
         if path == "/previews":
             self._render_previews_page()
             return
@@ -127,6 +130,9 @@ class ReviewHandler(
             return
         if path.startswith("/api/comments/") and path.endswith("/reply"):
             self._api_reply_comment(path)
+            return
+        if re.match(r"^/api/builds/\d+/changed-pages$", path):
+            self._api_update_changed_pages(path)
             return
         self.send_error(HTTPStatus.NOT_FOUND, "Route not found")
 

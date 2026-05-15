@@ -87,6 +87,9 @@ def db_connect() -> DBConnectionProxy:
     return DBConnectionProxy(conn)
 
 
+_CHANGED_PAGES_FILE = ".changed-pages"  # reserved filename in upload archives
+
+
 class SiteStore:
     def init_storage(self) -> None:
         raise NotImplementedError
@@ -97,7 +100,7 @@ class SiteStore:
     def rollback_replace(self, tag: str, had_existing_site: bool) -> None:
         raise NotImplementedError
 
-    def replace_site_from_archive(self, archive_path: Path, tag: str, progress_callback: Callable[[int, int], None] | None = None) -> None:
+    def replace_site_from_archive(self, archive_path: Path, tag: str, progress_callback: Callable[[int, int], None] | None = None) -> str | None:
         raise NotImplementedError
 
     def read_file(self, tag: str, rel_path: str) -> bytes | None:
@@ -156,7 +159,7 @@ class FilesystemSiteStore(SiteStore):
             except OSError:
                 _rmtree_parallel(previous_site_dir)
 
-    def replace_site_from_archive(self, archive_path: Path, tag: str, progress_callback: Callable[[int, int], None] | None = None) -> None:
+    def replace_site_from_archive(self, archive_path: Path, tag: str, progress_callback: Callable[[int, int], None] | None = None) -> str | None:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import logging
         import threading
@@ -165,14 +168,18 @@ class FilesystemSiteStore(SiteStore):
         dest = self._site_dir(tag, "site")
         dest.mkdir(parents=True, exist_ok=True)
 
-        # Count files first (fast — no extraction)
-        total = sum(1 for m in tarfile.open(archive_path, mode="r:*").getmembers() if m.isreg())
+        # Count regular site files (exclude reserved metadata file)
+        total = sum(
+            1 for m in tarfile.open(archive_path, mode="r:*").getmembers()
+            if m.isreg() and m.name not in (_CHANGED_PAGES_FILE, f"./{_CHANGED_PAGES_FILE}")
+        )
         _log.info("replace_site_from_archive %r: writing %d files in parallel to %s", tag, total, dest)
 
         completed = [0]
         counter_lock = threading.Lock()
         # Semaphore limits how many file payloads are in memory simultaneously.
         sem = threading.Semaphore(64)
+        changed_pages: str | None = None
 
         def _write(target: Path, data: bytes) -> None:
             try:
@@ -196,6 +203,12 @@ class FilesystemSiteStore(SiteStore):
                     if not parts or ".." in parts:
                         continue
                     rel = Path(*parts)
+                    # Intercept reserved metadata file — store, don't write to disk.
+                    if str(rel) == _CHANGED_PAGES_FILE and member.isreg():
+                        src = archive.extractfile(member)
+                        if src is not None:
+                            changed_pages = src.read().decode("utf-8", errors="replace").strip() or None
+                        continue
                     target = _safe_target(dest, rel)
                     if target is None:
                         continue
@@ -212,6 +225,7 @@ class FilesystemSiteStore(SiteStore):
             for f in as_completed(futures):
                 f.result()
         _log.info("replace_site_from_archive %r: done", tag)
+        return changed_pages
 
     def read_file(self, tag: str, rel_path: str) -> bytes | None:
         site_root = self._site_dir(tag, "site").resolve()
@@ -290,13 +304,14 @@ class GCSSiteStore(SiteStore):
         if had_existing_site and self._has_prefix(previous_prefix):
             self._copy_prefix(previous_prefix, site_prefix)
 
-    def replace_site_from_archive(self, archive_path: Path, tag: str, progress_callback: Callable[[int, int], None] | None = None) -> None:
+    def replace_site_from_archive(self, archive_path: Path, tag: str, progress_callback: Callable[[int, int], None] | None = None) -> str | None:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading
 
         site_prefix = self._snapshot_prefix(tag, "site")
 
         uploads: list[tuple[str, bytes, str]] = []
+        changed_pages: str | None = None
         with tarfile.open(archive_path, mode="r:*") as archive:
             for member in archive.getmembers():
                 if not member.isreg():
@@ -306,6 +321,12 @@ class GCSSiteStore(SiteStore):
                 if not parts or ".." in parts:
                     continue
                 rel_str = Path(*parts).as_posix()
+                # Intercept reserved metadata file — store, don't upload to GCS.
+                if rel_str == _CHANGED_PAGES_FILE:
+                    src = archive.extractfile(member)
+                    if src is not None:
+                        changed_pages = src.read().decode("utf-8", errors="replace").strip() or None
+                    continue
                 src = archive.extractfile(member)
                 if src is None:
                     continue
@@ -329,6 +350,7 @@ class GCSSiteStore(SiteStore):
             futures = {pool.submit(_upload, *u): u[0] for u in uploads}
             for f in as_completed(futures):
                 f.result()
+        return changed_pages
 
     def read_file(self, tag: str, rel_path: str) -> bytes | None:
         blob = self._bucket.blob(f"{self._snapshot_prefix(tag, 'site')}{rel_path}")
@@ -402,18 +424,19 @@ class LocalCacheSiteStore(SiteStore):
         if had_existing_site and prev.exists():
             prev.rename(site)
 
-    def replace_site_from_archive(self, archive_path: Path, tag: str, progress_callback: Callable[[int, int], None] | None = None) -> None:
+    def replace_site_from_archive(self, archive_path: Path, tag: str, progress_callback: Callable[[int, int], None] | None = None) -> str | None:
         dest = self._backing / tag / "site"
         fuse = _parse_fuse_mount(self._backing)
         if fuse:
             bucket, mount_point = fuse
             gcs_prefix = dest.relative_to(mount_point).as_posix()
             self._log.info("uploading %r to gs://%s/%s/ via GCS SDK...", tag, bucket, gcs_prefix)
-            _upload_archive_to_gcs(archive_path, bucket, gcs_prefix, self._log)
+            return _upload_archive_to_gcs(archive_path, bucket, gcs_prefix, self._log)
         else:
             self._log.info("extracting %r to local backing store...", tag)
-            extract_site_archive(archive_path, dest)
+            changed_pages = extract_site_archive(archive_path, dest)
             self._log.info("extracted %r to local backing store", tag)
+            return changed_pages
 
     def read_file(self, tag: str, rel_path: str) -> bytes | None:
         # Check FUSE backing store first (tar imports and direct GCS uploads land here).
@@ -507,6 +530,8 @@ def init_storage() -> None:
                 conn.execute("ALTER TABLE builds ADD COLUMN updated_at INTEGER")
             if "rewrite_host" not in columns:
                 conn.execute("ALTER TABLE builds ADD COLUMN rewrite_host TEXT")
+            if "changed_pages" not in columns:
+                conn.execute("ALTER TABLE builds ADD COLUMN changed_pages TEXT")
             comment_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(comments)").fetchall()}
             if "selection_json" not in comment_columns:
                 conn.execute("ALTER TABLE comments ADD COLUMN selection_json TEXT")
@@ -547,6 +572,7 @@ def init_storage() -> None:
 
                 ALTER TABLE builds ADD COLUMN IF NOT EXISTS updated_at BIGINT;
                 ALTER TABLE builds ADD COLUMN IF NOT EXISTS rewrite_host TEXT;
+                ALTER TABLE builds ADD COLUMN IF NOT EXISTS changed_pages TEXT;
                 ALTER TABLE comments ADD COLUMN IF NOT EXISTS selection_json TEXT;
                 """
             )
@@ -622,7 +648,7 @@ def _upload_archive_to_gcs(
     bucket_name: str,
     gcs_prefix: str,
     log: _logging.Logger,
-) -> None:
+) -> str | None:
     from concurrent.futures import ThreadPoolExecutor
 
     try:
@@ -645,6 +671,7 @@ def _upload_archive_to_gcs(
     uploaded = [0]
     counter_lock = _threading.Lock()
     new_names: set[str] = set()
+    changed_pages: str | None = None
 
     def _upload(blob_name: str, data: bytes, content_type: str) -> None:
         try:
@@ -665,6 +692,12 @@ def _upload_archive_to_gcs(
                 if not parts or ".." in parts:
                     continue
                 rel_str = Path(*parts).as_posix()
+                # Intercept reserved metadata file — store, don't upload to GCS.
+                if rel_str == _CHANGED_PAGES_FILE:
+                    src = archive.extractfile(member)
+                    if src is not None:
+                        changed_pages = src.read().decode("utf-8", errors="replace").strip() or None
+                    continue
                 src = archive.extractfile(member)
                 if src is None:
                     continue
@@ -686,12 +719,16 @@ def _upload_archive_to_gcs(
         log.info("deleting %d stale objects at gs://%s/%s/", len(stale), bucket_name, gcs_prefix)
         bucket.delete_blobs([bucket.blob(name) for name in stale])
 
+    return changed_pages
 
-def extract_site_archive(archive_path: Path, destination: Path) -> None:
+
+def extract_site_archive(archive_path: Path, destination: Path) -> str | None:
     import time as _time
     if destination.exists():
         shutil.rmtree(destination)
     destination.mkdir(parents=True, exist_ok=True)
+
+    changed_pages: str | None = None
 
     # r|gz streaming mode: single decompression pass (r:gz decompresses twice —
     # once for getmembers(), again for each extractfile() call).
@@ -702,6 +739,12 @@ def extract_site_archive(archive_path: Path, destination: Path) -> None:
             if not parts or ".." in parts:
                 continue
             rel = Path(*parts)
+            # Intercept reserved metadata file — store, don't write to disk.
+            if str(rel) == _CHANGED_PAGES_FILE and member.isreg():
+                src = archive.extractfile(member)
+                if src is not None:
+                    changed_pages = src.read().decode("utf-8", errors="replace").strip() or None
+                continue
             target = _safe_target(destination, rel)
             if target is None:
                 continue
@@ -728,6 +771,8 @@ def extract_site_archive(archive_path: Path, destination: Path) -> None:
             if i % 50 == 0:
                 _time.sleep(0)
 
+    return changed_pages
+
 
 def import_build_archive_path(
     archive_path: Path,
@@ -753,7 +798,7 @@ def import_build_archive_path(
             stage_callback(f"Importing file {n} of {total}")
 
     try:
-        SITE_STORE.replace_site_from_archive(archive_path, resolved_tag, progress_callback=_progress if stage_callback else None)
+        changed_pages = SITE_STORE.replace_site_from_archive(archive_path, resolved_tag, progress_callback=_progress if stage_callback else None)
     except Exception:
         SITE_STORE.rollback_replace(resolved_tag, had_existing_site)
         raise
@@ -769,20 +814,21 @@ def import_build_archive_path(
             conn.execute(
                 """
                 UPDATE builds
-                SET image_ref = ?, display_name = ?, rewrite_host = ?, archived_at = NULL, updated_at = ?
+                SET image_ref = ?, display_name = ?, rewrite_host = ?, changed_pages = ?,
+                    archived_at = NULL, updated_at = ?
                 WHERE id = ?
                 """,
-                (image_ref, resolved_name, stored_rewrite_host, now, build_id),
+                (image_ref, resolved_name, stored_rewrite_host, changed_pages, now, build_id),
             )
         else:
             if DB_BACKEND == "postgres":
                 inserted = conn.execute(
                     """
-                    INSERT INTO builds (image_ref, tag, display_name, rewrite_host, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO builds (image_ref, tag, display_name, rewrite_host, changed_pages, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     RETURNING id
                     """,
-                    (image_ref, resolved_tag, resolved_name, stored_rewrite_host, now, now),
+                    (image_ref, resolved_tag, resolved_name, stored_rewrite_host, changed_pages, now, now),
                 ).fetchone()
                 if not inserted:
                     raise ValueError("failed to create preview metadata")
@@ -790,10 +836,10 @@ def import_build_archive_path(
             else:
                 cur = conn.execute(
                     """
-                    INSERT INTO builds (image_ref, tag, display_name, rewrite_host, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO builds (image_ref, tag, display_name, rewrite_host, changed_pages, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (image_ref, resolved_tag, resolved_name, stored_rewrite_host, now, now),
+                    (image_ref, resolved_tag, resolved_name, stored_rewrite_host, changed_pages, now, now),
                 )
                 build_id = int(cur.lastrowid)
         conn.commit()
@@ -868,6 +914,18 @@ def inject_review_bundle(site_root: Path, build_id: int, tag: str) -> None:
         else:
             content = f"{content}\n{inject}"
         html_file.write_text(content, encoding="utf-8")
+
+
+def update_build_changed_pages(build_id: int, pages: list[str]) -> bool:
+    with db_connect() as conn:
+        row = conn.execute("SELECT id FROM builds WHERE id = ?", (build_id,)).fetchone()
+        if not row:
+            return False
+        cleaned = [p.strip() for p in pages if p.strip().startswith("/") and ".." not in p]
+        changed_pages = "\n".join(cleaned) or None
+        conn.execute("UPDATE builds SET changed_pages = ? WHERE id = ?", (changed_pages, build_id))
+        conn.commit()
+    return True
 
 
 def get_build_by_tag(tag: str) -> sqlite3.Row | None:

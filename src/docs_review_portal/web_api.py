@@ -60,11 +60,13 @@ from docs_review_portal.config import (
 from docs_review_portal.data import (
     create_comment,
     fetch_page_comments,
+    get_build_by_id,
     get_build_rewrite_host,
     import_build_archive_path,
     list_builds,
     normalize_selection_payload,
     set_comment_resolved,
+    update_build_changed_pages,
 )
 from docs_review_portal.helpers import (
     build_url,
@@ -357,4 +359,27 @@ class ReviewApiMixin:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
         self._send_json(HTTPStatus.CREATED, {"comment_id": comment_id})
+
+    def _api_update_changed_pages(self, path: str) -> None:
+        match = re.match(r"^/api/builds/(\d+)/changed-pages$", path)
+        if not match:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+            return
+        build_id = int(match.group(1))
+        if not get_build_by_id(build_id):
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Preview not found"})
+            return
+        payload = self._read_json()
+        pages = payload.get("pages")
+        if not isinstance(pages, list):
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "pages must be an array"})
+            return
+        if len(pages) > 5000:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "too many pages"})
+            return
+        if not all(isinstance(p, str) for p in pages):
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "each page must be a string"})
+            return
+        update_build_changed_pages(build_id, pages)
+        self._send_json(HTTPStatus.OK, {"ok": True})
 

@@ -2,10 +2,11 @@
 
 Single-container review service with:
 
-- `Previews` page with `Export comments` + `Delete` actions, site links, and comment counts
+- `Previews` page with browser-based archive upload, `Export comments` + `Delete` actions, site links, and comment counts
 - `Comments` page for centralized comment management with sortable columns and filters
 - Inline page comments on generated docs with line-range selection, replies, and resolve/unresolve
-- Direct site archive upload API
+- Changed pages tracking — automatically detect which pages changed on a branch, with an editable list per preview
+- Direct site archive upload API with chunked upload support for large archives
 - Soft-delete workflow for previews/comments with a 7-day recovery window before permanent deletion
 
 Code layout:
@@ -62,9 +63,10 @@ This command:
 
 1. takes the preview name you provide
 2. builds and exports the static site
-3. packages the export to `.tar.gz`
-4. uploads it to `POST /api/builds/upload?name=<name>`
-5. waits for server processing to complete
+3. generates a `.changed-pages` list by diffing `content/` against `origin/main` (if run from a feature branch inside the docs git repo)
+4. packages everything to `.tar.gz`
+5. uploads it to `POST /api/builds/upload?name=<name>`
+6. waits for server processing to complete
 
 The script normalizes the provided name to a URL-safe slug for preview routing.
 
@@ -101,6 +103,25 @@ Open:
 - `http://localhost:8080/comments`
 - `http://localhost:8080/logs`
 - `http://localhost:8080/healthz`
+
+## Upload a preview (browser)
+
+Open `/previews` and click **Upload preview**. The dialog has two tabs:
+
+- **Upload** — select a pre-built `.tar.gz` archive and fill in a preview name. One-liner commands for the Docker docs site and generic static sites are shown as a reference.
+- **Command line** — the `publish-branch.sh` script and raw `curl` API examples.
+
+The browser upload handles chunking automatically for large archives.
+
+## Changed pages
+
+Each preview can store a list of URLs that changed on the branch, so reviewers know where to focus.
+
+**Automatic** — when using `publish-branch.sh` or the Docker docs one-liner from the Upload dialog, a `.changed-pages` file is automatically generated from `git diff origin/main...HEAD -- content/` and bundled into the archive. Only works when run from a feature branch with content changes.
+
+**Manual** — open the list icon in the **Actions** column for any preview (or go to `/previews/<id>/changed-pages`) to add, remove, or edit paths by hand.
+
+**In the review widget** — when a preview has changed pages, a list icon appears in the comment panel header. Clicking it expands the list above the comments so reviewers can navigate directly to changed pages.
 
 ## Add a preview (API)
 
@@ -148,6 +169,7 @@ Generated docs are available at `http://localhost:8080/<tag>/`.
 |--------|------|-------------|
 | `GET` | `/api/builds` | List all builds with comment counts |
 | `POST` | `/api/builds/upload` | Upload a site archive (see above) |
+| `POST` | `/api/builds/<id>/changed-pages` | Replace the changed pages list for a preview — body: `{"pages": ["/path/", ...]}` |
 | `GET` | `/api/comments?build_id=<id>&page_path=<path>` | Fetch comments for a page |
 | `POST` | `/api/comments` | Create a comment |
 | `POST` | `/api/comments/<id>/resolve` | Resolve or unresolve a comment |
@@ -170,6 +192,8 @@ Database tables (SQLite local, Postgres in cloud):
 
 - `builds`: imported docs previews
 - `comments`: root comments + replies (`parent_id`)
+
+Build records include `changed_pages TEXT` — a newline-separated list of URL paths that changed on the branch, populated automatically from `.changed-pages` files in uploaded archives or set manually via the UI/API.
 
 Comment records include:
 

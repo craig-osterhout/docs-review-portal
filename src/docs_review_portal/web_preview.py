@@ -172,11 +172,14 @@ class ReviewPreviewMixin:
                 get_build_rewrite_host(build),
                 build_path(tag),
             )
+            changed_pages_raw = build["changed_pages"] if "changed_pages" in build.keys() else None
+            changed_pages_list = [ln.strip() for ln in str(changed_pages_raw).splitlines() if ln.strip()] if changed_pages_raw else []
             html_text = inject_review_bundle_html(
                 html_text,
                 build_id=int(build["id"]),
                 tag=str(build["tag"]),
                 page_path=canonical_page_path(f"/{resolved_rel}"),
+                changed_pages=changed_pages_list,
             )
             content = html_text.encode("utf-8")
         self.send_response(HTTPStatus.OK)

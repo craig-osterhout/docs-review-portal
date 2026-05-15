@@ -302,6 +302,65 @@
   color: #0b1320;
 }
 
+#review-changed-pages-section {
+  margin-bottom: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #dce6f3;
+}
+
+.review-changed-pages-count {
+  font-size: 12px;
+  color: #3b4d64;
+  padding-bottom: 6px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid #dce6f3;
+}
+
+.review-changed-pages-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.review-changed-pages-list li {
+  padding: 5px 6px;
+  border-radius: 5px;
+  font-size: 12px;
+  font-family: monospace;
+}
+
+.review-changed-pages-list li + li {
+  margin-top: 1px;
+}
+
+.review-changed-pages-list li.is-current {
+  background: #eef4fd;
+}
+
+.review-changed-pages-list a {
+  color: #1f3550;
+  text-decoration: none;
+  word-break: break-all;
+  display: block;
+}
+
+.review-changed-pages-list a:hover {
+  color: #1f73e5;
+  text-decoration: underline;
+}
+
+.review-current-page-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-family: sans-serif;
+  color: #58677a;
+  background: #dce6f3;
+  border-radius: 999px;
+  padding: 1px 6px;
+  margin-left: 4px;
+  vertical-align: middle;
+}
+
 @media (max-width: 900px) {
   .review-panel {
     width: calc(100vw - 56px);

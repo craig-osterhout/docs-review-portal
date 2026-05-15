@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import html
 import io
+import json
 import re
 from http import HTTPStatus
 from urllib.parse import urlencode, urlparse
@@ -17,6 +18,7 @@ from docs_review_portal.data import (
     fetch_build_comments_for_export,
     fetch_build_for_export,
     fetch_feedback,
+    get_build_by_id,
     list_builds,
     mark_build_archived,
     restore_archived_build,
@@ -46,6 +48,7 @@ class ReviewPagesMixin:
             preview_display = f"<strong>{name}</strong>"
             if name_raw != tag_raw:
                 preview_display = f"{preview_display}<br><span class=\"subtle\">{tag}</span>"
+            changed_pages_raw = row["changed_pages"] if "changed_pages" in row.keys() else None
             archived_raw = row["archived_at"] if "archived_at" in row.keys() else None
             archived_at = int(archived_raw) if archived_raw is not None else None
             delete_at = compute_delete_at(archived_at)
@@ -107,6 +110,12 @@ class ReviewPagesMixin:
                   <td><a href="/comments?build_id={build_id}">{open_comments} open / {comments} total</a></td>
                   <td>
                     <div class="preview-actions">
+                      <a class="icon-action" href="/previews/{build_id}/changed-pages" title="Changed pages" aria-label="Changed pages">
+                        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                          <path d="M8 6h13"></path><path d="M8 12h13"></path><path d="M8 18h13"></path>
+                          <path d="M3 6h.01"></path><path d="M3 12h.01"></path><path d="M3 18h.01"></path>
+                        </svg>
+                      </a>
                       <a class="icon-action" href="/previews/{build_id}/comments.csv" title="Export comments" aria-label="Export comments">
                         <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                           <path d="M12 3v11"></path>
@@ -170,7 +179,9 @@ class ReviewPagesMixin:
               <li>
                 <strong>Prepare archive</strong>
                 <p class="subtle" style="margin:6px 0 4px">Docker docs site &mdash; run from the repo root:</p>
-                <pre class="code-hint">docker buildx bake release --set "release.output=type=local,dest=/tmp/preview-site" &amp;&amp; tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/preview-site</pre>
+                <pre class="code-hint">docker buildx bake release --set "release.output=type=local,dest=/tmp/preview-site" &amp;&amp; \
+git diff origin/main...HEAD --name-only --diff-filter=ACM -- content/ | sed 's|^content||;s|/_index\.md$|/|;s|/index\.md$|/|;s|\.md$|/|;s|^/manuals/|/|' | sort -u &gt; /tmp/preview-site/.changed-pages &amp;&amp; \
+tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/preview-site</pre>
                 <p class="subtle" style="margin:8px 0 4px">Other static sites (output in <code>dist/</code>):</p>
                 <pre class="code-hint">tar -C dist -czf /tmp/my-preview.tar.gz .</pre>
               </li>
@@ -511,4 +522,139 @@ class ReviewPagesMixin:
             self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
             return
         self._redirect("/comments")
+
+    def _render_changed_pages_page(self, path: str) -> None:
+        match = re.match(r"^/(?:publications|previews)/(\d+)/changed-pages$", path)
+        if not match:
+            self.send_error(HTTPStatus.NOT_FOUND, "Route not found")
+            return
+        build_id = int(match.group(1))
+        build = get_build_by_id(build_id)
+        if not build:
+            self.send_error(HTTPStatus.NOT_FOUND, "Preview not found")
+            return
+
+        tag = str(build["tag"])
+        name_raw = (str(build["display_name"]) if build["display_name"] is not None else "").strip() or tag
+        raw = build["changed_pages"] if "changed_pages" in build.keys() else None
+        pages = [ln.strip() for ln in str(raw).splitlines() if ln.strip()] if raw else []
+
+        items_html = "\n".join(
+            f"""<li class="changed-pages-item" data-path="{html.escape(p)}">
+              <a href="{html.escape(build_url(tag, p, base=self._public_base()))}" target="_blank" rel="noreferrer">{html.escape(p)}</a>
+              <button type="button" class="remove-page-btn icon-action" aria-label="Remove {html.escape(p)}">&times;</button>
+            </li>"""
+            for p in pages
+        ) if pages else '<li class="changed-pages-empty subtle"><em>No pages listed yet.</em></li>'
+
+        body = f"""
+        <section class="panel">
+          <p><a href="/previews">&larr; Back to previews</a></p>
+          <h1>Changed pages</h1>
+          <p>Preview: <strong>{html.escape(name_raw)}</strong>
+             {f'<span class="subtle">({html.escape(tag)})</span>' if name_raw != tag else ''}</p>
+          <p class="subtle" id="page-count">{len(pages)} page{"s" if len(pages) != 1 else ""}</p>
+          <ul class="changed-pages-list" id="changed-pages-list">
+            {items_html}
+          </ul>
+          <div style="display:flex;gap:8px;margin-top:12px">
+            <input type="text" id="add-page-input" placeholder="/path/to/page/" style="flex:1">
+            <button type="button" id="add-page-btn">Add</button>
+          </div>
+          <div style="display:flex;align-items:center;gap:12px;margin-top:16px">
+            <button type="button" id="save-pages-btn">Save changes</button>
+            <span id="save-status" class="subtle"></span>
+          </div>
+        </section>
+        <script>
+        (function() {{
+          var BUILD_ID = {build_id};
+          var tag = {json.dumps(tag)};
+          var baseUrl = {json.dumps(self._public_base())};
+          var list = document.getElementById('changed-pages-list');
+          var addInput = document.getElementById('add-page-input');
+          var addBtn = document.getElementById('add-page-btn');
+          var saveBtn = document.getElementById('save-pages-btn');
+          var saveStatus = document.getElementById('save-status');
+          var countEl = document.getElementById('page-count');
+
+          function updateCount() {{
+            var n = list.querySelectorAll('.changed-pages-item').length;
+            countEl.textContent = n + (n === 1 ? ' page' : ' pages');
+          }}
+
+          function escHtml(v) {{
+            return String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+          }}
+
+          function wireRemove(li) {{
+            li.querySelector('.remove-page-btn').addEventListener('click', function() {{
+              li.remove();
+              var empty = list.querySelectorAll('.changed-pages-item').length === 0;
+              if (empty) {{
+                list.innerHTML = '<li class="changed-pages-empty subtle"><em>No pages listed yet.</em></li>';
+              }}
+              updateCount();
+              saveStatus.textContent = '';
+            }});
+          }}
+
+          list.querySelectorAll('.changed-pages-item').forEach(wireRemove);
+
+          function addPage(rawPath) {{
+            var p = rawPath.trim();
+            if (!p) return;
+            if (!p.startsWith('/')) p = '/' + p;
+            var empty = list.querySelector('.changed-pages-empty');
+            if (empty) empty.remove();
+            var li = document.createElement('li');
+            li.className = 'changed-pages-item';
+            li.dataset.path = p;
+            li.innerHTML = '<a href="' + escHtml(baseUrl + '/' + tag + p) + '" target="_blank" rel="noreferrer">' + escHtml(p) + '</a>'
+              + '<button type="button" class="remove-page-btn icon-action" aria-label="Remove">&times;</button>';
+            wireRemove(li);
+            list.appendChild(li);
+            updateCount();
+            saveStatus.textContent = '';
+          }}
+
+          addBtn.addEventListener('click', function() {{
+            addPage(addInput.value);
+            addInput.value = '';
+            addInput.focus();
+          }});
+          addInput.addEventListener('keydown', function(e) {{
+            if (e.key === 'Enter') {{ e.preventDefault(); addBtn.click(); }}
+          }});
+
+          saveBtn.addEventListener('click', function() {{
+            var pages = Array.from(list.querySelectorAll('.changed-pages-item'))
+              .map(function(li) {{ return li.dataset.path || li.querySelector('a').textContent.trim(); }})
+              .filter(Boolean);
+            saveBtn.disabled = true;
+            saveStatus.textContent = 'Saving…';
+            fetch('/api/builds/' + BUILD_ID + '/changed-pages', {{
+              method: 'POST',
+              headers: {{'Content-Type': 'application/json'}},
+              body: JSON.stringify({{pages: pages}}),
+            }})
+            .then(function(r) {{ return r.json(); }})
+            .then(function(data) {{
+              saveBtn.disabled = false;
+              if (data.ok) {{
+                saveStatus.textContent = 'Saved.';
+                setTimeout(function() {{ saveStatus.textContent = ''; }}, 2500);
+              }} else {{
+                saveStatus.textContent = data.error || 'Error saving.';
+              }}
+            }})
+            .catch(function(err) {{
+              saveBtn.disabled = false;
+              saveStatus.textContent = 'Network error: ' + err.message;
+            }});
+          }});
+        }})();
+        </script>
+        """
+        self._send_html(HTTPStatus.OK, html_page(f"Changed pages — {html.escape(name_raw)}", body))
 
