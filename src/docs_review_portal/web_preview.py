@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import html
 import mimetypes
 import re
 from http import HTTPStatus
 from urllib.parse import urlparse
 
+from docs_review_portal import import_status
 from docs_review_portal.config import PREVIEW_CONTEXT_COOKIE, RESERVED_ROOT_SEGMENTS, STATIC_DIR
 from docs_review_portal.data import SITE_STORE, get_build_by_tag, get_build_rewrite_host
 from docs_review_portal.helpers import (
     build_path,
     canonical_page_path,
+    html_page,
     inject_review_bundle_html,
     rewrite_docs_domain_urls,
     sanitize_rel_path,
@@ -17,6 +20,24 @@ from docs_review_portal.helpers import (
 
 
 class ReviewPreviewMixin:
+    def _send_upload_in_progress(self, tag: str) -> None:
+        body = html_page(
+            "Upload in progress",
+            f"""<section class="panel">
+              <h1>Upload in progress</h1>
+              <p>The preview <strong>{html.escape(tag)}</strong> is currently being updated.</p>
+              <p class="subtle">This page will refresh automatically when it&rsquo;s ready.</p>
+            </section>""",
+            auto_refresh=3,
+        )
+        data = body.encode("utf-8")
+        self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Retry-After", "3")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _serve_asset(self, rel_path: str) -> None:
         rel = sanitize_rel_path(rel_path)
         if rel is None:
@@ -111,7 +132,10 @@ class ReviewPreviewMixin:
     def _serve_build(self, tag: str, req_path: str) -> None:
         build = get_build_by_tag(tag)
         if not build:
-            self.send_error(HTTPStatus.NOT_FOUND, "Unknown preview tag")
+            if import_status.is_active(tag):
+                self._send_upload_in_progress(tag)
+            else:
+                self.send_error(HTTPStatus.NOT_FOUND, "Unknown preview tag")
             return
         rel = sanitize_rel_path(req_path)
         if rel is None:
@@ -134,7 +158,10 @@ class ReviewPreviewMixin:
             if rel == "assets/review-client.js":
                 self._serve_asset("review-client.js")
                 return
-            self.send_error(HTTPStatus.NOT_FOUND, "Page not found")
+            if import_status.is_active(tag):
+                self._send_upload_in_progress(tag)
+            else:
+                self.send_error(HTTPStatus.NOT_FOUND, "Page not found")
             return
 
         ctype = mimetypes.guess_type(resolved_rel)[0] or "application/octet-stream"

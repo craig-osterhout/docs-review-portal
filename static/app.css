@@ -274,6 +274,162 @@ tr.is-archived .status.archived {
   min-width: 140px;
 }
 
+/* Upload dialog */
+dialog {
+  border: 1px solid #d9e2ef;
+  border-radius: 12px;
+  padding: 24px;
+  max-width: 600px;
+  width: calc(100vw - 40px);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
+}
+
+dialog::backdrop {
+  background: rgba(10, 19, 32, 0.45);
+}
+
+.dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 18px;
+}
+
+.dialog-header h2 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.dialog-close {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid #bfccd9;
+  border-radius: 8px;
+  background: #fff;
+  color: #17324d;
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.dialog-close:hover {
+  border-color: #7ea9e8;
+  background: #eef4ff;
+  color: #0b5fd3;
+}
+
+.dialog-rule {
+  border: none;
+  border-top: 1px solid #e6edf5;
+  margin: 14px 0 0;
+}
+
+/* Tabs */
+.tab-bar {
+  display: flex;
+  gap: 2px;
+  border-bottom: 2px solid #e6edf5;
+  margin-bottom: 2px;
+}
+
+.tab-btn {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  color: #5d6a7c;
+  padding: 8px 14px;
+  margin-bottom: -2px;
+  font-weight: 600;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.tab-btn:hover {
+  background: none;
+  color: #17324d;
+}
+
+.tab-btn.active {
+  border-bottom-color: #1f73e5;
+  color: #1f73e5;
+}
+
+/* Numbered upload steps */
+.upload-steps {
+  list-style: none;
+  counter-reset: upload-step;
+  padding: 0;
+  margin: 16px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.upload-steps > li {
+  counter-increment: upload-step;
+  padding-left: 38px;
+  position: relative;
+}
+
+.upload-steps > li::before {
+  content: counter(upload-step);
+  position: absolute;
+  left: 0;
+  top: 2px;
+  width: 24px;
+  height: 24px;
+  background: #1f73e5;
+  color: #fff;
+  border-radius: 50%;
+  font-size: 0.75rem;
+  font-weight: 700;
+  line-height: 24px;
+  text-align: center;
+}
+
+/* Upload progress bar */
+.upload-bar-track {
+  height: 8px;
+  background: #e6edf5;
+  border-radius: 4px;
+  overflow: hidden;
+  margin: 14px 0 6px;
+}
+
+.upload-bar {
+  height: 100%;
+  width: 0%;
+  background: #1f73e5;
+  border-radius: 4px;
+  transition: width 0.25s ease, background 0.25s ease;
+}
+
+.upload-bar.success {
+  background: #1a7d3f;
+}
+
+.upload-bar.error {
+  background: #b42332;
+}
+
+/* Code snippet block inside details */
+.code-hint {
+  background: #f4f7fb;
+  border: 1px solid #d9e2ef;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 0.82rem;
+  overflow-x: auto;
+  white-space: pre;
+  margin: 6px 0 0;
+}
+
 blockquote {
   margin: 8px 0;
   padding: 8px 10px;

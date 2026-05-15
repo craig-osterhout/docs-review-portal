@@ -48,6 +48,13 @@ def get_failed(tag: str) -> dict[str, Any] | None:
         return entry if entry and entry["failed"] else None
 
 
+def is_active(tag: str) -> bool:
+    """Return True if there is a non-failed import in progress for this tag."""
+    with _lock:
+        entry = _imports.get(tag)
+        return entry is not None and not entry["failed"]
+
+
 def get_all() -> list[dict[str, Any]]:
     now = time.time()
     with _lock:

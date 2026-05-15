@@ -633,14 +633,18 @@ def _upload_archive_to_gcs(
     client = _gcs.Client()
     bucket = client.bucket(bucket_name)
 
-    existing = list(bucket.list_blobs(prefix=f"{gcs_prefix}/"))
-    if existing:
-        log.info("deleting %d existing objects at gs://%s/%s/", len(existing), bucket_name, gcs_prefix)
-        bucket.delete_blobs(existing)
+    # Snapshot existing blob names before uploading. New files are written first
+    # (overwriting matching paths in place) so the preview stays live throughout.
+    # Only after all uploads succeed do we delete blobs that are no longer present.
+    existing_names = {b.name for b in bucket.list_blobs(prefix=f"{gcs_prefix}/")}
+    if existing_names:
+        log.info("found %d existing objects at gs://%s/%s/, will remove stale after upload",
+                 len(existing_names), bucket_name, gcs_prefix)
 
     sem = _threading.Semaphore(64)
     uploaded = [0]
     counter_lock = _threading.Lock()
+    new_names: set[str] = set()
 
     def _upload(blob_name: str, data: bytes, content_type: str) -> None:
         try:
@@ -666,13 +670,21 @@ def _upload_archive_to_gcs(
                     continue
                 data = src.read()
                 content_type = mimetypes.guess_type(rel_str)[0] or "application/octet-stream"
+                blob_name = f"{gcs_prefix}/{rel_str}"
+                new_names.add(blob_name)  # tracked from main thread, no lock needed
                 sem.acquire()
-                futures.append(pool.submit(_upload, f"{gcs_prefix}/{rel_str}", data, content_type))
+                futures.append(pool.submit(_upload, blob_name, data, content_type))
 
     for f in futures:
         f.result()
 
     log.info("uploaded %d objects to gs://%s/%s/", uploaded[0], bucket_name, gcs_prefix)
+
+    # Delete any blobs from the old set that are not in the new archive.
+    stale = existing_names - new_names
+    if stale:
+        log.info("deleting %d stale objects at gs://%s/%s/", len(stale), bucket_name, gcs_prefix)
+        bucket.delete_blobs([bucket.blob(name) for name in stale])
 
 
 def extract_site_archive(archive_path: Path, destination: Path) -> None:

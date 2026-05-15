@@ -17,6 +17,26 @@ class ReviewCommonMixin:
         host = self.headers.get("Host") or f"localhost:{PUBLIC_PORT}"
         scheme = self.headers.get("X-Forwarded-Proto") or ("https" if "443" in host else "http")
         return f"{scheme}://{host}"
+    def send_error(self, code, message=None, explain=None):  # noqa: N802
+        try:
+            status = HTTPStatus(int(code))
+        except (ValueError, KeyError):
+            status = HTTPStatus.INTERNAL_SERVER_ERROR
+        path = getattr(self, "path", "") or ""
+        if path.startswith("/api/"):
+            self._send_json(status, {"error": message or status.phrase})
+            return
+        title = f"{status.value} {status.phrase}"
+        body = html_page(
+            title,
+            f"""<section class="panel">
+              <h1>{title}</h1>
+              <p class="subtle">{html.escape(message or status.phrase)}</p>
+              <p><a href="/previews">&larr; Back to previews</a></p>
+            </section>""",
+        )
+        self._send_html(status, body)
+
     def _handle_exception(self, exc: Exception) -> None:
         if self.path.startswith("/api/"):
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
