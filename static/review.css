@@ -361,6 +361,61 @@
   vertical-align: middle;
 }
 
+#review-diff-section {
+  margin-bottom: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #dce6f3;
+}
+
+.review-diff-loading,
+.review-diff-error {
+  font-size: 12px;
+  color: #58677a;
+  padding: 6px 0;
+}
+
+.review-diff-error {
+  color: #a3471b;
+}
+
+.review-diff-content {
+  font-size: 11px;
+  font-family: monospace;
+  white-space: pre;
+  overflow-x: auto;
+  margin: 0;
+  padding: 6px;
+  background: #f8fbff;
+  border: 1px solid #dce6f3;
+  border-radius: 6px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.review-diff-line {
+  display: block;
+}
+
+.review-diff-add {
+  background: rgba(34, 197, 94, 0.15);
+  color: #166534;
+}
+
+.review-diff-del {
+  background: rgba(239, 68, 68, 0.12);
+  color: #991b1b;
+}
+
+.review-diff-hunk {
+  color: #1e40af;
+  font-weight: 600;
+}
+
+.review-diff-header {
+  color: #58677a;
+  font-weight: 600;
+}
+
 @media (max-width: 900px) {
   .review-panel {
     width: calc(100vw - 56px);

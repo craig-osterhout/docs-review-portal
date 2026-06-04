@@ -60,6 +60,7 @@ from docs_review_portal.config import (
 from docs_review_portal.data import (
     create_comment,
     fetch_page_comments,
+    fetch_page_diff,
     get_build_by_id,
     get_build_rewrite_host,
     import_build_archive_path,
@@ -382,4 +383,22 @@ class ReviewApiMixin:
             return
         update_build_changed_pages(build_id, pages)
         self._send_json(HTTPStatus.OK, {"ok": True})
+
+    def _api_get_page_diff(self, path: str, query: dict[str, list[str]]) -> None:
+        match = re.match(r"^/api/builds/(\d+)/page-diff$", path)
+        if not match:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+            return
+        build_id = int(match.group(1))
+        page_path = query.get("page", [""])[0] or "/"
+        diff_content = fetch_page_diff(build_id, page_path)
+        if diff_content is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Diff not found for this page"})
+            return
+        data = diff_content.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 

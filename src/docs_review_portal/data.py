@@ -88,6 +88,7 @@ def db_connect() -> DBConnectionProxy:
 
 
 _CHANGED_PAGES_FILE = ".changed-pages"  # reserved filename in upload archives
+_DIFFS_DIR = ".diffs"  # reserved directory prefix for per-page diff files
 
 
 class SiteStore:
@@ -168,10 +169,12 @@ class FilesystemSiteStore(SiteStore):
         dest = self._site_dir(tag, "site")
         dest.mkdir(parents=True, exist_ok=True)
 
-        # Count regular site files (exclude reserved metadata file)
+        # Count regular site files (exclude reserved metadata and diff files)
         total = sum(
             1 for m in tarfile.open(archive_path, mode="r:*").getmembers()
-            if m.isreg() and m.name not in (_CHANGED_PAGES_FILE, f"./{_CHANGED_PAGES_FILE}")
+            if m.isreg()
+            and m.name not in (_CHANGED_PAGES_FILE, f"./{_CHANGED_PAGES_FILE}")
+            and not any(p == _DIFFS_DIR for p in Path(m.name).parts)
         )
         _log.info("replace_site_from_archive %r: writing %d files in parallel to %s", tag, total, dest)
 
@@ -208,6 +211,9 @@ class FilesystemSiteStore(SiteStore):
                         src = archive.extractfile(member)
                         if src is not None:
                             changed_pages = src.read().decode("utf-8", errors="replace").strip() or None
+                        continue
+                    # Skip reserved diff files — extracted separately.
+                    if rel.parts[0] == _DIFFS_DIR:
                         continue
                     target = _safe_target(dest, rel)
                     if target is None:
@@ -326,6 +332,9 @@ class GCSSiteStore(SiteStore):
                     src = archive.extractfile(member)
                     if src is not None:
                         changed_pages = src.read().decode("utf-8", errors="replace").strip() or None
+                    continue
+                # Skip reserved diff files — extracted separately.
+                if rel_str.startswith(f"{_DIFFS_DIR}/"):
                     continue
                 src = archive.extractfile(member)
                 if src is None:
@@ -523,6 +532,16 @@ def init_storage() -> None:
                 CREATE INDEX IF NOT EXISTS idx_comments_build_page ON comments(build_id, page_path);
                 CREATE INDEX IF NOT EXISTS idx_comments_parent ON comments(parent_id);
                 CREATE INDEX IF NOT EXISTS idx_comments_resolved ON comments(resolved);
+
+                CREATE TABLE IF NOT EXISTS page_diffs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    build_id INTEGER NOT NULL,
+                    page_path TEXT NOT NULL,
+                    diff_content TEXT NOT NULL,
+                    FOREIGN KEY(build_id) REFERENCES builds(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_page_diffs_build_page ON page_diffs(build_id, page_path);
                 """
             )
             columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(builds)").fetchall()}
@@ -532,6 +551,8 @@ def init_storage() -> None:
                 conn.execute("ALTER TABLE builds ADD COLUMN rewrite_host TEXT")
             if "changed_pages" not in columns:
                 conn.execute("ALTER TABLE builds ADD COLUMN changed_pages TEXT")
+            if "diff_pages" not in columns:
+                conn.execute("ALTER TABLE builds ADD COLUMN diff_pages TEXT")
             comment_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(comments)").fetchall()}
             if "selection_json" not in comment_columns:
                 conn.execute("ALTER TABLE comments ADD COLUMN selection_json TEXT")
@@ -573,7 +594,17 @@ def init_storage() -> None:
                 ALTER TABLE builds ADD COLUMN IF NOT EXISTS updated_at BIGINT;
                 ALTER TABLE builds ADD COLUMN IF NOT EXISTS rewrite_host TEXT;
                 ALTER TABLE builds ADD COLUMN IF NOT EXISTS changed_pages TEXT;
+                ALTER TABLE builds ADD COLUMN IF NOT EXISTS diff_pages TEXT;
                 ALTER TABLE comments ADD COLUMN IF NOT EXISTS selection_json TEXT;
+
+                CREATE TABLE IF NOT EXISTS page_diffs (
+                    id BIGSERIAL PRIMARY KEY,
+                    build_id BIGINT NOT NULL REFERENCES builds(id),
+                    page_path TEXT NOT NULL,
+                    diff_content TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_page_diffs_build_page ON page_diffs(build_id, page_path);
                 """
             )
 
@@ -698,6 +729,9 @@ def _upload_archive_to_gcs(
                     if src is not None:
                         changed_pages = src.read().decode("utf-8", errors="replace").strip() or None
                     continue
+                # Skip reserved diff files — extracted separately.
+                if rel_str.startswith(f"{_DIFFS_DIR}/"):
+                    continue
                 src = archive.extractfile(member)
                 if src is None:
                     continue
@@ -745,6 +779,9 @@ def extract_site_archive(archive_path: Path, destination: Path) -> str | None:
                 if src is not None:
                     changed_pages = src.read().decode("utf-8", errors="replace").strip() or None
                 continue
+            # Skip reserved diff files — extracted separately.
+            if rel.parts[0] == _DIFFS_DIR:
+                continue
             target = _safe_target(destination, rel)
             if target is None:
                 continue
@@ -772,6 +809,44 @@ def extract_site_archive(archive_path: Path, destination: Path) -> str | None:
                 _time.sleep(0)
 
     return changed_pages
+
+
+def _extract_diffs_from_archive(archive_path: Path) -> dict[str, str]:
+    """Return {canonical_page_path: diff_content} for all .diffs/ entries in the archive."""
+    result: dict[str, str] = {}
+    with tarfile.open(archive_path, mode="r:*") as archive:
+        for member in archive.getmembers():
+            if not member.isreg():
+                continue
+            rel = Path(member.name)
+            parts = [p for p in rel.parts if p not in ("", ".")]
+            if len(parts) < 2 or parts[0] != _DIFFS_DIR:
+                continue
+            src = archive.extractfile(member)
+            if src is None:
+                continue
+            diff_rel = "/".join(parts[1:])
+            page_path = canonical_page_path(f"/{diff_rel}")
+            result[page_path] = src.read().decode("utf-8", errors="replace")
+    return result
+
+
+def store_page_diffs(conn: DBConnectionProxy, build_id: int, page_diffs_map: dict[str, str]) -> None:
+    conn.execute("DELETE FROM page_diffs WHERE build_id = ?", (build_id,))
+    for page_path, diff_content in page_diffs_map.items():
+        conn.execute(
+            "INSERT INTO page_diffs (build_id, page_path, diff_content) VALUES (?, ?, ?)",
+            (build_id, page_path, diff_content),
+        )
+
+
+def fetch_page_diff(build_id: int, page_path: str) -> str | None:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT diff_content FROM page_diffs WHERE build_id = ? AND page_path = ?",
+            (build_id, canonical_page_path(page_path)),
+        ).fetchone()
+    return str(row["diff_content"]) if row else None
 
 
 def import_build_archive_path(
@@ -803,6 +878,9 @@ def import_build_archive_path(
         SITE_STORE.rollback_replace(resolved_tag, had_existing_site)
         raise
 
+    page_diffs_map = _extract_diffs_from_archive(archive_path)
+    diff_pages = "\n".join(sorted(page_diffs_map.keys())) or None
+
     now = now_ts()
     if stage_callback:
         stage_callback("Updating preview metadata")
@@ -815,20 +893,20 @@ def import_build_archive_path(
                 """
                 UPDATE builds
                 SET image_ref = ?, display_name = ?, rewrite_host = ?, changed_pages = ?,
-                    archived_at = NULL, updated_at = ?
+                    diff_pages = ?, archived_at = NULL, updated_at = ?
                 WHERE id = ?
                 """,
-                (image_ref, resolved_name, stored_rewrite_host, changed_pages, now, build_id),
+                (image_ref, resolved_name, stored_rewrite_host, changed_pages, diff_pages, now, build_id),
             )
         else:
             if DB_BACKEND == "postgres":
                 inserted = conn.execute(
                     """
-                    INSERT INTO builds (image_ref, tag, display_name, rewrite_host, changed_pages, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO builds (image_ref, tag, display_name, rewrite_host, changed_pages, diff_pages, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     RETURNING id
                     """,
-                    (image_ref, resolved_tag, resolved_name, stored_rewrite_host, changed_pages, now, now),
+                    (image_ref, resolved_tag, resolved_name, stored_rewrite_host, changed_pages, diff_pages, now, now),
                 ).fetchone()
                 if not inserted:
                     raise ValueError("failed to create preview metadata")
@@ -836,12 +914,13 @@ def import_build_archive_path(
             else:
                 cur = conn.execute(
                     """
-                    INSERT INTO builds (image_ref, tag, display_name, rewrite_host, changed_pages, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO builds (image_ref, tag, display_name, rewrite_host, changed_pages, diff_pages, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (image_ref, resolved_tag, resolved_name, stored_rewrite_host, changed_pages, now, now),
+                    (image_ref, resolved_tag, resolved_name, stored_rewrite_host, changed_pages, diff_pages, now, now),
                 )
                 build_id = int(cur.lastrowid)
+        store_page_diffs(conn, build_id, page_diffs_map)
         conn.commit()
 
     return ImportedBuild(

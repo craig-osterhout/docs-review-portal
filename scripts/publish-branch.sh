@@ -81,6 +81,18 @@ if [ -d "$DOCS_DIR/content" ] && git -C "$DOCS_DIR" rev-parse --git-dir >/dev/nu
   fi
 fi
 
+# Generate .diffs/ directory: per-file unified diffs for changed content files.
+if [ -d "$DOCS_DIR/content" ] && git -C "$DOCS_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+  printf 'Generating per-page diffs...\n' >&2
+  git -C "$DOCS_DIR" diff origin/main...HEAD --name-only --diff-filter=ACM -- content/ | while IFS= read -r FILE; do
+    PAGE_PATH="$(printf '%s' "$FILE" | sed 's|^content||; s|/_index\.md$|/|; s|/index\.md$|/|; s|\.md$|/|; s|^/manuals/|/|')"
+    DIFF_FILE="$(printf '%s' "$PAGE_PATH" | sed 's|/$|/index.html|; s|^/||')"
+    mkdir -p "$DOCS_DIR/$OUT_REL/.diffs/$(dirname "$DIFF_FILE")"
+    git -C "$DOCS_DIR" diff origin/main...HEAD -- "$FILE" > "$DOCS_DIR/$OUT_REL/.diffs/$DIFF_FILE"
+  done
+  printf 'Done.\n' >&2
+fi
+
 # Package the built site as a .tar.gz upload payload.
 (cd "$DOCS_DIR" && tar -C "$OUT_REL" -czf "$ARCHIVE_REL" .)
 

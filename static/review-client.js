@@ -5,6 +5,7 @@
   }
 
   const REVIEWER_KEY = "docs-review-reviewer";
+  const PANEL_VISIBLE_KEY = "docs-review-panel-visible";
   const CONTENT_ROOT = document.querySelector("main") || document.body;
   const HAS_CUSTOM_HIGHLIGHT_API =
     typeof window.Highlight === "function" &&
@@ -26,9 +27,17 @@
   let reviewerBadge = null;
   let changedPagesSection = null;
   let changedPagesVisible = false;
+  let diffSection = null;
+  let diffVisible = false;
+  let diffLoaded = false;
 
   assignLineNumbers();
   panel = createPanel();
+  try {
+    if (window.localStorage.getItem(PANEL_VISIBLE_KEY) === "0") {
+      setPanelVisible(false);
+    }
+  } catch (_) {}
   refreshComments();
 
   document.addEventListener("mouseup", onSelectionComplete);
@@ -395,6 +404,7 @@
     const label = visible ? "Hide comments panel" : "Show comments panel";
     panelShowButton.title = label;
     panelShowButton.setAttribute("aria-label", label);
+    try { window.localStorage.setItem(PANEL_VISIBLE_KEY, visible ? "1" : "0"); } catch (_) {}
   }
 
   function createPanel() {
@@ -408,6 +418,11 @@
         <div class="review-panel-head">
           <h2>Comments</h2>
           <div class="review-panel-head-actions">
+            ${ctx.hasDiff ? `<button type="button" class="review-icon-button" id="review-diff-btn" title="View diff for this page" aria-label="View diff for this page">
+              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M12 3v18"></path><path d="M5 10l-3 3 3 3"></path><path d="M19 10l3 3-3 3"></path>
+              </svg>
+            </button>` : ""}
             ${ctx.changedPages && ctx.changedPages.length ? `<button type="button" class="review-icon-button" id="review-changed-pages-btn" title="Changed pages" aria-label="Changed pages">
               <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                 <path d="M8 6h13"></path><path d="M8 12h13"></path><path d="M8 18h13"></path>
@@ -447,6 +462,7 @@
           <span class="review-current-reviewer" id="review-current-reviewer">Reviewer: not set</span>
         </div>
         <div id="review-changed-pages-section" hidden></div>
+        <div id="review-diff-section" hidden></div>
         <div class="review-comment-hint">Highlight text on the page to add comments.</div>
         <div id="review-panel-body">Loading...</div>
       </div>
@@ -529,7 +545,12 @@
       changedPagesBtn.addEventListener("click", toggleChangedPagesView);
     }
 
-    setPanelVisible(true);
+    diffSection = aside.querySelector("#review-diff-section");
+    var diffBtn = aside.querySelector("#review-diff-btn");
+    if (diffBtn) {
+      diffBtn.addEventListener("click", toggleDiffView);
+    }
+
     return aside;
   }
 
@@ -540,6 +561,61 @@
     }
     var btn = panel && panel.querySelector("#review-changed-pages-btn");
     if (btn) { btn.classList.toggle("is-active", changedPagesVisible); }
+  }
+
+  function toggleDiffView() {
+    diffVisible = !diffVisible;
+    if (diffSection) {
+      diffSection.hidden = !diffVisible;
+    }
+    var btn = panel && panel.querySelector("#review-diff-btn");
+    if (btn) { btn.classList.toggle("is-active", diffVisible); }
+    if (diffVisible && !diffLoaded) {
+      loadDiff();
+    }
+  }
+
+  async function loadDiff() {
+    if (!diffSection) {
+      return;
+    }
+    diffSection.innerHTML = '<div class="review-diff-loading">Loading diff…</div>';
+    var url = "/api/builds/" + encodeURIComponent(String(ctx.buildId)) + "/page-diff?page=" + encodeURIComponent(ctx.pagePath);
+    try {
+      var response = await fetch(url);
+      if (!response.ok) {
+        diffSection.innerHTML = '<div class="review-diff-error">Diff not available.</div>';
+        return;
+      }
+      var text = await response.text();
+      diffLoaded = true;
+      diffSection.innerHTML = "";
+      diffSection.appendChild(renderDiff(text));
+    } catch (err) {
+      diffSection.innerHTML = '<div class="review-diff-error">Failed to load diff.</div>';
+    }
+  }
+
+  function renderDiff(text) {
+    var pre = document.createElement("pre");
+    pre.className = "review-diff-content";
+    text.split("\n").forEach(function (line) {
+      var span = document.createElement("span");
+      span.className = "review-diff-line";
+      if (line.startsWith("+++") || line.startsWith("---")) {
+        span.classList.add("review-diff-header");
+      } else if (line.startsWith("+")) {
+        span.classList.add("review-diff-add");
+      } else if (line.startsWith("-")) {
+        span.classList.add("review-diff-del");
+      } else if (line.startsWith("@@")) {
+        span.classList.add("review-diff-hunk");
+      }
+      span.textContent = line;
+      pre.appendChild(span);
+      pre.appendChild(document.createTextNode("\n"));
+    });
+    return pre;
   }
 
   function onViewportChanged() {

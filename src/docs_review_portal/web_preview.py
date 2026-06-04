@@ -174,12 +174,17 @@ class ReviewPreviewMixin:
             )
             changed_pages_raw = build["changed_pages"] if "changed_pages" in build.keys() else None
             changed_pages_list = [ln.strip() for ln in str(changed_pages_raw).splitlines() if ln.strip()] if changed_pages_raw else []
+            page_path = canonical_page_path(f"/{resolved_rel}")
+            diff_pages_raw = build["diff_pages"] if "diff_pages" in build.keys() else None
+            diff_pages_set = {ln.strip() for ln in str(diff_pages_raw).splitlines() if ln.strip()} if diff_pages_raw else set()
+            has_diff = page_path in diff_pages_set
             html_text = inject_review_bundle_html(
                 html_text,
                 build_id=int(build["id"]),
                 tag=str(build["tag"]),
-                page_path=canonical_page_path(f"/{resolved_rel}"),
+                page_path=page_path,
                 changed_pages=changed_pages_list,
+                has_diff=has_diff,
             )
             content = html_text.encode("utf-8")
         self.send_response(HTTPStatus.OK)

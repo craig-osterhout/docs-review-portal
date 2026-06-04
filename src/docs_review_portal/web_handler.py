@@ -83,6 +83,9 @@ class ReviewHandler(
         if path == "/api/builds":
             self._api_get_builds()
             return
+        if re.match(r"^/api/builds/\d+/page-diff$", path):
+            self._api_get_page_diff(path, query)
+            return
         if path == "/api/comments":
             self._api_get_comments(query)
             return
