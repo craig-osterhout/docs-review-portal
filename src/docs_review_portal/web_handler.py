@@ -152,6 +152,20 @@ def serve() -> None:
         purge_expired_archived_builds()
     except Exception:
         pass
+
+    from docs_review_portal.config import GITHUB_WATCHES, GITHUB_POLL_INTERVAL
+    if GITHUB_WATCHES:
+        import threading as _threading
+        from docs_review_portal.github_poller import start_poller
+        _threading.Thread(
+            target=start_poller,
+            args=(GITHUB_WATCHES, GITHUB_POLL_INTERVAL),
+            daemon=True,
+        ).start()
+        logging.getLogger(__name__).info(
+            "github_poller: watching %d repo(s)", len(GITHUB_WATCHES)
+        )
+
     server = ThreadingHTTPServer((HOST, PORT), ReviewHandler)
     print(f"Docs review service running on http://{HOST}:{PORT}")
     server.serve_forever()

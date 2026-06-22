@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
@@ -51,6 +52,16 @@ RESERVED_ROOT_SEGMENTS = {
     "feedback",
     "builds",
 }
+
+# GitHub Actions polling integration
+_github_watches_raw = (os.environ.get("GITHUB_WATCHES") or "").strip()
+try:
+    GITHUB_WATCHES: list[dict] = json.loads(_github_watches_raw) if _github_watches_raw else []
+    if not isinstance(GITHUB_WATCHES, list):
+        GITHUB_WATCHES = []
+except (json.JSONDecodeError, ValueError):
+    GITHUB_WATCHES = []
+GITHUB_POLL_INTERVAL: int = int(os.environ.get("GITHUB_POLL_INTERVAL", "300"))
 
 INJECT_START = "<!-- DOCS_REVIEW_START -->"
 INJECT_END = "<!-- DOCS_REVIEW_END -->"

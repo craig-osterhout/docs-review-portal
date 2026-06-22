@@ -201,6 +201,93 @@ Comment records include:
 - `line_start`, `line_end`, `selected_text`
 - `reviewer`, `resolved`, timestamps
 
+## GitHub Actions integration
+
+The service can poll one or more GitHub repositories for PR preview artifacts and import them automatically. This lets contributors open a PR, wait a few minutes, and find a live preview link posted as a PR comment — no manual upload needed.
+
+### How it works
+
+1. A GitHub Actions workflow in your docs repo builds the site on every PR open/update, uploads the result as a named artifact (`preview-pr-{number}`), and posts a PR comment with the preview URL.
+2. The review service polls the GitHub API every `GITHUB_POLL_INTERVAL` seconds, finds new or updated artifacts, downloads them, and imports the preview.
+
+### Configuration
+
+Set `GITHUB_WATCHES` to a JSON array of repos to watch:
+
+```json
+[{"repo": "myorg/mydocs", "token": "ghp_xxx"}]
+```
+
+Each entry supports:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `repo` | yes | `owner/repo` of the GitHub repository to watch |
+| `token` | yes | GitHub fine-grained PAT with `contents:read`, `actions:read` |
+| `rewrite_host` | no | Hostname to rewrite to relative paths (e.g. `docs.example.com`); defaults to `docs.docker.com` |
+
+Set `REVIEW_PORTAL_URL` to the public URL of this service so the PR comment contains a working link:
+
+```
+REVIEW_PORTAL_URL=https://review.internal.example.com
+```
+
+If `GITHUB_WATCHES` is not set, the poller does not start and all existing behavior is unchanged.
+
+### Required GitHub Actions workflow
+
+Your docs repo needs a workflow that builds the site and uploads the artifact with the name `preview-pr-{number}`. Here is a generic example to adapt:
+
+```yaml
+name: Preview
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Build your static site. Adjust this step for your site generator.
+      # The built output must be written to ./out/
+      - name: Build site
+        run: hugo --minify -d ./out
+
+      - name: Package preview
+        run: |
+          # Generate a list of changed pages (adjust content path as needed).
+          # Each line is a URL path, e.g. /guides/install/
+          git diff origin/${{ github.base_ref }}...HEAD --name-only -- content/ \
+            | sed 's|^content||; s|\.md$|/|; /^\//!s|^|/|' \
+            > ./out/.changed-pages
+
+          tar -czf preview.tar.gz -C ./out .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: preview-pr-${{ github.event.pull_request.number }}
+          path: preview.tar.gz
+          retention-days: 1
+
+      - name: Comment preview link
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          body="A preview of this PR will be available at ${{ vars.REVIEW_PORTAL_URL }}/pr-${{ github.event.pull_request.number }}/ within 15 minutes."
+          gh pr comment "${{ github.event.pull_request.number }}" --edit-last --body "$body" 2>/dev/null \
+            || gh pr comment "${{ github.event.pull_request.number }}" --body "$body"
+```
+
+The artifact name `preview-pr-{number}` is the convention the poller looks for. The `.changed-pages` file inside the archive is optional but enables the changed-pages feature in the review UI.
+
 ## Configuration
 
 All configuration is via environment variables:
@@ -216,6 +303,8 @@ All configuration is via environment variables:
 | `REVIEW_GCS_PREFIX` | `docs-review` | Key prefix within the GCS bucket (gcs mode only) |
 | `REVIEW_DATABASE_URL` | — | Postgres connection string; if unset uses SQLite |
 | `REVIEW_DEFAULT_REVIEWER` | `anonymous` | Fallback reviewer name used when a comment is submitted via the API without a `reviewer` field |
+| `GITHUB_WATCHES` | — | JSON array of `{repo, token}` objects; enables GitHub PR polling (see above) |
+| `GITHUB_POLL_INTERVAL` | `300` | Seconds between GitHub poll cycles |
 
 ## Persistence modes
 
