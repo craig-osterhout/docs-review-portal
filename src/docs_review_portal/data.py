@@ -1087,6 +1087,7 @@ def delete_build_and_comments(build_id: int) -> bool:
             return False
         tag = str(row["tag"])
         conn.execute("DELETE FROM comments WHERE build_id = ?", (build_id,))
+        conn.execute("DELETE FROM page_diffs WHERE build_id = ?", (build_id,))
         conn.execute("DELETE FROM builds WHERE id = ?", (build_id,))
         conn.commit()
     try:
