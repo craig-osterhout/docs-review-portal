@@ -65,30 +65,44 @@ rm -rf "$DOCS_DIR/$OUT_REL"
 mkdir -p "$DOCS_DIR/$OUT_REL" "$(dirname "$ARCHIVE")"
 (cd "$DOCS_DIR" && docker buildx bake release --set "release.output=type=local,dest=$OUT_REL")
 
-# Generate .changed-pages list: URL paths for files added/modified vs origin/main.
+# Changed-page detection compares against the branch point (merge-base with
+# origin/main), not origin/main's current tip, so pages that changed on main
+# after this branch forked don't show up as false positives. And it diffs
+# against the working tree (not HEAD), plus includes not-yet-tracked files, so
+# it matches what was actually built above — docker buildx bake reads the
+# filesystem as-is, including uncommitted and untracked edits. A HEAD-only
+# comparison would silently drop those pages from the list (and, on the next
+# publish, overwrite any previously-detected pages with an empty result).
 # Only runs when a content/ directory and a git repo are present.
 if [ -d "$DOCS_DIR/content" ] && git -C "$DOCS_DIR" rev-parse --git-dir >/dev/null 2>&1; then
   printf 'Detecting changed pages...\n' >&2
-  git -C "$DOCS_DIR" diff origin/main...HEAD --name-only --diff-filter=ACM -- content/ \
-    | sed 's|^content||; s|/_index\.md$|/|; s|/index\.md$|/|; s|\.md$|/|; s|^/manuals/|/|' \
+  MERGE_BASE="$(git -C "$DOCS_DIR" merge-base origin/main HEAD)"
+  {
+    git -C "$DOCS_DIR" diff "$MERGE_BASE" --name-only --diff-filter=ACM -- content/
+    git -C "$DOCS_DIR" ls-files --others --exclude-standard -- content/
+  } | sed 's|^content||; s|/_index\.md$|/|; s|/index\.md$|/|; s|\.md$|/|; s|^/manuals/|/|' \
     | sort -u > "$DOCS_DIR/$OUT_REL/.changed-pages"
   CHANGED_COUNT="$(wc -l < "$DOCS_DIR/$OUT_REL/.changed-pages" | tr -d ' \t\n')"
   if [ "$CHANGED_COUNT" -eq 0 ]; then
     rm -f "$DOCS_DIR/$OUT_REL/.changed-pages"
-    printf 'No changed pages detected (no diff against origin/main).\n' >&2
+    printf 'No changed pages detected (working tree matches the branch point).\n' >&2
   else
     printf 'Found %s changed page(s).\n' "$CHANGED_COUNT" >&2
   fi
 fi
 
 # Generate .diffs/ directory: per-file unified diffs for changed content files.
+# Limited to already-tracked files — git can't produce a meaningful unified diff
+# for untracked new pages (they still show up in .changed-pages above, just
+# without a diff view).
 if [ -d "$DOCS_DIR/content" ] && git -C "$DOCS_DIR" rev-parse --git-dir >/dev/null 2>&1; then
   printf 'Generating per-page diffs...\n' >&2
-  git -C "$DOCS_DIR" diff origin/main...HEAD --name-only --diff-filter=ACM -- content/ | while IFS= read -r FILE; do
+  MERGE_BASE="$(git -C "$DOCS_DIR" merge-base origin/main HEAD)"
+  git -C "$DOCS_DIR" diff "$MERGE_BASE" --name-only --diff-filter=ACM -- content/ | while IFS= read -r FILE; do
     PAGE_PATH="$(printf '%s' "$FILE" | sed 's|^content||; s|/_index\.md$|/|; s|/index\.md$|/|; s|\.md$|/|; s|^/manuals/|/|')"
     DIFF_FILE="$(printf '%s' "$PAGE_PATH" | sed 's|/$|/index.html|; s|^/||')"
     mkdir -p "$DOCS_DIR/$OUT_REL/.diffs/$(dirname "$DIFF_FILE")"
-    git -C "$DOCS_DIR" diff origin/main...HEAD -- "$FILE" > "$DOCS_DIR/$OUT_REL/.diffs/$DIFF_FILE"
+    git -C "$DOCS_DIR" diff "$MERGE_BASE" -- "$FILE" > "$DOCS_DIR/$OUT_REL/.diffs/$DIFF_FILE"
   done
   printf 'Done.\n' >&2
 fi
