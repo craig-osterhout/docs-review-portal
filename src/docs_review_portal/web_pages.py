@@ -27,6 +27,7 @@ from docs_review_portal.data import (
 from docs_review_portal.helpers import (
     build_path,
     build_url,
+    canonical_page_path,
     compute_delete_at,
     format_ts,
     html_page,
@@ -314,6 +315,7 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
         to_input = query.get("to", [""])[0]
         sort_key = query.get("sort", ["created_at"])[0]
         sort_dir = query.get("dir", ["desc"])[0].lower()
+        embed = (query.get("embed", ["0"])[0] or "0") == "1"
         if sort_dir not in ("asc", "desc"):
             sort_dir = "desc"
         filters = {
@@ -355,6 +357,8 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
                 params["from"] = from_input
             if to_input:
                 params["to"] = to_input
+            if embed:
+                params["embed"] = "1"
             params["sort"] = column
             params["dir"] = next_dir
             arrow = ""
@@ -396,14 +400,14 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
                 <tr id="review-comment-{comment['id']}"{row_class}>
                   <td>{preview_label}</td>
                   <td>
-                    <a href="{html.escape(location)}" target="_blank" rel="noreferrer">{html.escape(str(comment['page_path']))}</a>
+                    <a class="comment-page-link" href="{html.escape(location)}" target="_blank" rel="noreferrer">{html.escape(str(comment['page_path']))}</a>
                     <div class="subtle">lines {comment.get('line_start') or '-'} - {comment.get('line_end') or '-'}</div>
                   </td>
                   <td>{html.escape(str(comment['reviewer']))}</td>
                   <td>{comment['created_at_human']}</td>
                   <td>{status_markup}</td>
                   <td>
-                    <a href="{html.escape(location)}" target="_blank" rel="noreferrer">{html.escape(str(comment['body']))}</a>
+                    <a class="comment-page-link" href="{html.escape(location)}" target="_blank" rel="noreferrer">{html.escape(str(comment['body']))}</a>
                     {f"<blockquote>{html.escape(str(comment['selected_text']))}</blockquote>" if comment.get('selected_text') else ""}
                   </td>
                 </tr>
@@ -438,6 +442,7 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
             </label>
             <input type="hidden" name="sort" value="{html.escape(sort_key)}">
             <input type="hidden" name="dir" value="{html.escape(sort_dir)}">
+            {'<input type="hidden" name="embed" value="1">' if embed else ''}
             <button type="submit">Apply</button>
           </form>
         </section>
@@ -458,8 +463,21 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
             </tbody>
           </table>
         </section>
+        {f'''<script>
+        (function() {{
+          if (window.parent && window.parent !== window) {{
+            document.addEventListener('click', function(e) {{
+              var link = e.target.closest && e.target.closest('.comment-page-link');
+              if (!link) {{ return; }}
+              e.preventDefault();
+              if (window.parent.__reviewCloseModal) {{ window.parent.__reviewCloseModal(); }}
+              window.parent.location.href = link.href;
+            }});
+          }}
+        }})();
+        </script>''' if embed else ''}
         """
-        self._send_html(HTTPStatus.OK, html_page("Comments", body))
+        self._send_html(HTTPStatus.OK, html_page("Comments", body, embed=embed))
 
     def _delete_preview(self, path: str) -> None:
         match = re.match(r"^/(?:publications|previews)/(\d+)/delete$", path)
@@ -523,7 +541,7 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
             return
         self._redirect("/comments")
 
-    def _render_changed_pages_page(self, path: str) -> None:
+    def _render_changed_pages_page(self, path: str, query: dict[str, list[str]] | None = None) -> None:
         match = re.match(r"^/(?:publications|previews)/(\d+)/changed-pages$", path)
         if not match:
             self.send_error(HTTPStatus.NOT_FOUND, "Route not found")
@@ -534,36 +552,101 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
             self.send_error(HTTPStatus.NOT_FOUND, "Preview not found")
             return
 
+        query = query or {}
+        embed = (query.get("embed", ["0"])[0] or "0") == "1"
+        select_raw = (query.get("select", [""])[0] or "").strip()
+
         tag = str(build["tag"])
         name_raw = (str(build["display_name"]) if build["display_name"] is not None else "").strip() or tag
         raw = build["changed_pages"] if "changed_pages" in build.keys() else None
         pages = [ln.strip() for ln in str(raw).splitlines() if ln.strip()] if raw else []
+        diff_raw = build["diff_pages"] if "diff_pages" in build.keys() else None
+        diff_pages_set = {ln.strip() for ln in str(diff_raw).splitlines() if ln.strip()} if diff_raw else set()
 
-        items_html = "\n".join(
-            f"""<li class="changed-pages-item" data-path="{html.escape(p)}">
-              <a href="{html.escape(build_url(tag, p, base=self._public_base()))}" target="_blank" rel="noreferrer">{html.escape(p)}</a>
-              <button type="button" class="remove-page-btn icon-action" aria-label="Remove {html.escape(p)}">&times;</button>
-            </li>"""
-            for p in pages
-        ) if pages else '<li class="changed-pages-empty subtle"><em>No pages listed yet.</em></li>'
+        selected_page = None
+        if select_raw:
+            select_canon = canonical_page_path(select_raw)
+            for p in pages:
+                if canonical_page_path(p) == select_canon:
+                    selected_page = p
+                    break
+
+        def build_page_tree(paths: list[str]) -> dict:
+            root: dict = {}
+            for p in paths:
+                segments = [s for s in p.strip("/").split("/") if s]
+                if not segments:
+                    continue
+                node = root
+                for i, seg in enumerate(segments):
+                    entry = node.setdefault(seg, {"children": {}, "page": None})
+                    if i == len(segments) - 1:
+                        entry["page"] = p
+                    node = entry["children"]
+            return root
+
+        def render_file_row(p: str, label: str) -> str:
+            has_diff = canonical_page_path(p) in diff_pages_set
+            p_esc = html.escape(p)
+            label_esc = html.escape(label)
+            status_cls = "status-modified" if has_diff else "status-added"
+            status_label = "M" if has_diff else "A"
+            status_title = "Modified &mdash; diff available" if has_diff else "Added &mdash; no diff available"
+            preview_link = html.escape(build_url(tag, p, base=self._public_base()))
+            return f"""<button type="button" class="file-select-btn" title="{p_esc}">
+                <span class="file-status-badge {status_cls}" title="{status_title}">{status_label}</span>
+                <span class="file-path">{label_esc}</span>
+              </button>
+              <a class="icon-action open-preview-link" href="{preview_link}" target="_blank" rel="noreferrer" title="Open preview" aria-label="Open preview for {p_esc}">&#8599;</a>"""
+
+        def render_tree(node: dict) -> str:
+            dirs = sorted((seg for seg, e in node.items() if e["children"]))
+            files = sorted((seg for seg, e in node.items() if not e["children"]))
+            parts = []
+            for seg in dirs:
+                entry = node[seg]
+                page = entry["page"]
+                if page is not None:
+                    has_diff = canonical_page_path(page) in diff_pages_set
+                    header = (
+                        f'<div class="changed-pages-item tree-row" data-path="{html.escape(page)}" '
+                        f'data-has-diff="{"1" if has_diff else "0"}">{render_file_row(page, seg)}</div>'
+                    )
+                else:
+                    header = f'<div class="tree-dir-label">{html.escape(seg)}/</div>'
+                parts.append(
+                    f'<li class="tree-dir">{header}<ul class="tree-children">{render_tree(entry["children"])}</ul></li>'
+                )
+            for seg in files:
+                page = node[seg]["page"]
+                has_diff = canonical_page_path(page) in diff_pages_set
+                parts.append(
+                    f'<li class="changed-pages-item tree-row" data-path="{html.escape(page)}" '
+                    f'data-has-diff="{"1" if has_diff else "0"}">{render_file_row(page, seg)}</li>'
+                )
+            return "\n".join(parts)
+
+        items_html = render_tree(build_page_tree(pages)) if pages else (
+            '<li class="changed-pages-empty subtle"><em>No pages listed yet.</em></li>'
+        )
 
         body = f"""
         <section class="panel">
-          <p><a href="/previews">&larr; Back to previews</a></p>
+          {'' if embed else '<p><a href="/previews">&larr; Back to previews</a></p>'}
           <h1>Changed pages</h1>
           <p>Preview: <strong>{html.escape(name_raw)}</strong>
              {f'<span class="subtle">({html.escape(tag)})</span>' if name_raw != tag else ''}</p>
           <p class="subtle" id="page-count">{len(pages)} page{"s" if len(pages) != 1 else ""}</p>
-          <ul class="changed-pages-list" id="changed-pages-list">
-            {items_html}
-          </ul>
-          <div style="display:flex;gap:8px;margin-top:12px">
-            <input type="text" id="add-page-input" placeholder="/path/to/page/" style="flex:1">
-            <button type="button" id="add-page-btn">Add</button>
-          </div>
-          <div style="display:flex;align-items:center;gap:12px;margin-top:16px">
-            <button type="button" id="save-pages-btn">Save changes</button>
-            <span id="save-status" class="subtle"></span>
+
+          <div class="diff-page-layout">
+            <div class="diff-sidebar">
+              <ul class="changed-pages-list" id="changed-pages-list">
+                {items_html}
+              </ul>
+            </div>
+            <div class="diff-viewer" id="diff-viewer">
+              <div class="diff-empty subtle"><em>Select a page to view its diff.</em></div>
+            </div>
           </div>
         </section>
         <script>
@@ -571,90 +654,287 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
           var BUILD_ID = {build_id};
           var tag = {json.dumps(tag)};
           var baseUrl = {json.dumps(self._public_base())};
+          var EMBED = {json.dumps(embed)};
           var list = document.getElementById('changed-pages-list');
-          var addInput = document.getElementById('add-page-input');
-          var addBtn = document.getElementById('add-page-btn');
-          var saveBtn = document.getElementById('save-pages-btn');
-          var saveStatus = document.getElementById('save-status');
-          var countEl = document.getElementById('page-count');
+          var diffViewer = document.getElementById('diff-viewer');
+          var activePath = null;
 
-          function updateCount() {{
-            var n = list.querySelectorAll('.changed-pages-item').length;
-            countEl.textContent = n + (n === 1 ? ' page' : ' pages');
+          if (EMBED && window.parent && window.parent !== window) {{
+            list.addEventListener('click', function(e) {{
+              var link = e.target.closest && e.target.closest('.open-preview-link');
+              if (!link) {{ return; }}
+              e.preventDefault();
+              if (window.parent.__reviewCloseModal) {{ window.parent.__reviewCloseModal(); }}
+              window.parent.location.href = link.href;
+            }});
           }}
 
           function escHtml(v) {{
             return String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
           }}
 
-          function wireRemove(li) {{
-            li.querySelector('.remove-page-btn').addEventListener('click', function() {{
-              li.remove();
-              var empty = list.querySelectorAll('.changed-pages-item').length === 0;
-              if (empty) {{
-                list.innerHTML = '<li class="changed-pages-empty subtle"><em>No pages listed yet.</em></li>';
-              }}
-              updateCount();
-              saveStatus.textContent = '';
+          function buildUrlFor(p) {{
+            return baseUrl + '/' + tag + p;
+          }}
+
+          function wireSelect(li) {{
+            var btn = li.querySelector('.file-select-btn');
+            if (btn) {{
+              btn.addEventListener('click', function() {{ selectFile(li); }});
+            }}
+          }}
+
+          function selectFile(li) {{
+            var pagePath = li.dataset.path;
+            activePath = pagePath;
+            list.querySelectorAll('.changed-pages-item').forEach(function(item) {{
+              item.classList.toggle('is-selected', item === li);
             }});
+            if (li.scrollIntoView) {{ li.scrollIntoView({{block: 'nearest'}}); }}
+            if (li.dataset.hasDiff !== '1') {{
+              diffViewer.innerHTML = '<div class="diff-empty subtle"><em>No diff available for this page &mdash; it looks like a new page.</em><br>'
+                + '<a href="' + escHtml(buildUrlFor(pagePath)) + '" target="_blank" rel="noreferrer">Open preview</a></div>';
+              return;
+            }}
+            diffViewer.innerHTML = '<div class="diff-loading subtle">Loading diff&hellip;</div>';
+            fetch('/api/builds/' + BUILD_ID + '/page-diff?page=' + encodeURIComponent(pagePath))
+              .then(function(r) {{
+                if (!r.ok) {{ throw new Error('not found'); }}
+                return r.text();
+              }})
+              .then(function(text) {{
+                if (activePath !== pagePath) {{ return; }}
+                diffViewer.innerHTML = '';
+                diffViewer.appendChild(renderDiff(text, pagePath));
+              }})
+              .catch(function() {{
+                if (activePath !== pagePath) {{ return; }}
+                diffViewer.innerHTML = '<div class="diff-error subtle">Failed to load diff.</div>';
+              }});
           }}
 
-          list.querySelectorAll('.changed-pages-item').forEach(wireRemove);
-
-          function addPage(rawPath) {{
-            var p = rawPath.trim();
-            if (!p) return;
-            if (!p.startsWith('/')) p = '/' + p;
-            var empty = list.querySelector('.changed-pages-empty');
-            if (empty) empty.remove();
-            var li = document.createElement('li');
-            li.className = 'changed-pages-item';
-            li.dataset.path = p;
-            li.innerHTML = '<a href="' + escHtml(baseUrl + '/' + tag + p) + '" target="_blank" rel="noreferrer">' + escHtml(p) + '</a>'
-              + '<button type="button" class="remove-page-btn icon-action" aria-label="Remove">&times;</button>';
-            wireRemove(li);
-            list.appendChild(li);
-            updateCount();
-            saveStatus.textContent = '';
+          // ---- word-level diff (LCS over whitespace-separated tokens) ----
+          function tokenize(str) {{
+            return str.match(/\\s+|[^\\s]+/g) || [];
           }}
 
-          addBtn.addEventListener('click', function() {{
-            addPage(addInput.value);
-            addInput.value = '';
-            addInput.focus();
-          }});
-          addInput.addEventListener('keydown', function(e) {{
-            if (e.key === 'Enter') {{ e.preventDefault(); addBtn.click(); }}
-          }});
-
-          saveBtn.addEventListener('click', function() {{
-            var pages = Array.from(list.querySelectorAll('.changed-pages-item'))
-              .map(function(li) {{ return li.dataset.path || li.querySelector('a').textContent.trim(); }})
-              .filter(Boolean);
-            saveBtn.disabled = true;
-            saveStatus.textContent = 'Saving…';
-            fetch('/api/builds/' + BUILD_ID + '/changed-pages', {{
-              method: 'POST',
-              headers: {{'Content-Type': 'application/json'}},
-              body: JSON.stringify({{pages: pages}}),
-            }})
-            .then(function(r) {{ return r.json(); }})
-            .then(function(data) {{
-              saveBtn.disabled = false;
-              if (data.ok) {{
-                saveStatus.textContent = 'Saved.';
-                setTimeout(function() {{ saveStatus.textContent = ''; }}, 2500);
+          function lcsDiff(a, b) {{
+            var n = a.length, m = b.length;
+            var dp = new Array(n + 1);
+            var i, j;
+            for (i = 0; i <= n; i++) {{ dp[i] = new Array(m + 1).fill(0); }}
+            for (i = n - 1; i >= 0; i--) {{
+              for (j = m - 1; j >= 0; j--) {{
+                dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+              }}
+            }}
+            var oldOps = [], newOps = [], common = 0;
+            i = 0; j = 0;
+            while (i < n && j < m) {{
+              if (a[i] === b[j]) {{
+                oldOps.push({{t: 'eq', v: a[i]}});
+                newOps.push({{t: 'eq', v: b[j]}});
+                common++; i++; j++;
+              }} else if (dp[i + 1][j] >= dp[i][j + 1]) {{
+                oldOps.push({{t: 'del', v: a[i]}}); i++;
               }} else {{
-                saveStatus.textContent = data.error || 'Error saving.';
+                newOps.push({{t: 'add', v: b[j]}}); j++;
               }}
-            }})
-            .catch(function(err) {{
-              saveBtn.disabled = false;
-              saveStatus.textContent = 'Network error: ' + err.message;
+            }}
+            while (i < n) {{ oldOps.push({{t: 'del', v: a[i]}}); i++; }}
+            while (j < m) {{ newOps.push({{t: 'add', v: b[j]}}); j++; }}
+            return {{oldOps: oldOps, newOps: newOps, common: common, total: Math.max(n, m)}};
+          }}
+
+          function renderLineContent(ops, kind) {{
+            var frag = document.createDocumentFragment();
+            ops.forEach(function(op) {{
+              var span = document.createElement('span');
+              if (op.t === kind) {{
+                span.className = 'diff-word-' + kind;
+              }}
+              span.textContent = op.v;
+              frag.appendChild(span);
             }});
-          }});
+            return frag;
+          }}
+
+          function makeRow(oldNo, newNo, marker, rowClass) {{
+            var tr = document.createElement('tr');
+            if (rowClass) {{ tr.className = rowClass; }}
+            var oldTd = document.createElement('td'); oldTd.className = 'diff-line-no'; oldTd.textContent = oldNo || '';
+            var newTd = document.createElement('td'); newTd.className = 'diff-line-no'; newTd.textContent = newNo || '';
+            var markTd = document.createElement('td'); markTd.className = 'diff-marker'; markTd.textContent = marker || '';
+            var contentTd = document.createElement('td'); contentTd.className = 'diff-content';
+            tr.appendChild(oldTd); tr.appendChild(newTd); tr.appendChild(markTd); tr.appendChild(contentTd);
+            return {{tr: tr, contentTd: contentTd}};
+          }}
+
+          var DIFF_EDGE_CONTEXT = 3;
+          var DIFF_COLLAPSE_MIN_HIDDEN = 3;
+
+          function makeExpandRow(hiddenTrs) {{
+            var tr = document.createElement('tr');
+            tr.className = 'diff-row-expand';
+            var td = document.createElement('td');
+            td.colSpan = 4;
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'diff-expand-btn';
+            var icon = document.createElement('span');
+            icon.className = 'diff-expand-icons';
+            icon.textContent = '\\u2303\\u2304';
+            btn.appendChild(icon);
+            btn.appendChild(document.createTextNode(
+              'Show ' + hiddenTrs.length + ' unchanged line' + (hiddenTrs.length === 1 ? '' : 's')
+            ));
+            btn.addEventListener('click', function() {{
+              hiddenTrs.forEach(function(hiddenTr) {{ tr.parentNode.insertBefore(hiddenTr, tr); }});
+              tr.remove();
+            }});
+            td.appendChild(btn);
+            tr.appendChild(td);
+            return tr;
+          }}
+
+          function flushContext(buffer, tbody) {{
+            if (!buffer.length) {{ return; }}
+            var hiddenCount = buffer.length - DIFF_EDGE_CONTEXT * 2;
+            if (hiddenCount <= DIFF_COLLAPSE_MIN_HIDDEN) {{
+              buffer.forEach(function(tr) {{ tbody.appendChild(tr); }});
+              buffer.length = 0;
+              return;
+            }}
+            var head = buffer.slice(0, DIFF_EDGE_CONTEXT);
+            var hidden = buffer.slice(DIFF_EDGE_CONTEXT, buffer.length - DIFF_EDGE_CONTEXT);
+            var tail = buffer.slice(buffer.length - DIFF_EDGE_CONTEXT);
+            head.forEach(function(tr) {{ tbody.appendChild(tr); }});
+            tbody.appendChild(makeExpandRow(hidden));
+            tail.forEach(function(tr) {{ tbody.appendChild(tr); }});
+            buffer.length = 0;
+          }}
+
+          function renderDiff(text, pagePath) {{
+            var wrap = document.createElement('div');
+            wrap.className = 'diff-file-wrap';
+            var titleBar = document.createElement('div');
+            titleBar.className = 'diff-file-title';
+            titleBar.textContent = pagePath;
+            wrap.appendChild(titleBar);
+
+            if (text.indexOf('Binary files') === 0 || /\\nBinary files /.test(text)) {{
+              var binMsg = document.createElement('div');
+              binMsg.className = 'diff-empty subtle';
+              binMsg.textContent = 'Binary file — no diff to display.';
+              wrap.appendChild(binMsg);
+              return wrap;
+            }}
+
+            var table = document.createElement('table');
+            table.className = 'diff-table';
+            var tbody = document.createElement('tbody');
+            table.appendChild(tbody);
+
+            var lines = text.split('\\n');
+            if (lines.length && lines[lines.length - 1] === '') {{ lines.pop(); }}
+
+            var i = 0;
+            var sawHunk = false;
+            while (i < lines.length) {{
+              var line = lines[i];
+              var hunkMatch = /^@@ -(\\d+)(?:,(\\d+))? \\+(\\d+)(?:,(\\d+))? @@.*$/.exec(line);
+              if (!hunkMatch) {{ i++; continue; }}
+
+              sawHunk = true;
+              var oldNo = parseInt(hunkMatch[1], 10);
+              var newNo = parseInt(hunkMatch[3], 10);
+              var hunkRow = document.createElement('tr');
+              hunkRow.className = 'diff-row-hunk';
+              var hunkTd = document.createElement('td');
+              hunkTd.colSpan = 4;
+              hunkTd.textContent = line;
+              hunkRow.appendChild(hunkTd);
+              tbody.appendChild(hunkRow);
+              i++;
+
+              var ctxBuffer = [];
+              while (i < lines.length && lines[i].charAt(0) !== '@') {{
+                var dels = [], adds = [];
+                while (i < lines.length && lines[i].charAt(0) === '-') {{ dels.push(lines[i].slice(1)); i++; }}
+                while (i < lines.length && lines[i].charAt(0) === '+') {{ adds.push(lines[i].slice(1)); i++; }}
+
+                if (dels.length || adds.length) {{
+                  flushContext(ctxBuffer, tbody);
+                  var pairCount = Math.min(dels.length, adds.length);
+                  var k;
+                  for (k = 0; k < pairCount; k++) {{
+                    var d = lcsDiff(tokenize(dels[k]), tokenize(adds[k]));
+                    var similar = d.total === 0 || (d.common / d.total) >= 0.25;
+                    var rDel = makeRow(oldNo++, '', '-', 'diff-row-del');
+                    var rAdd = makeRow('', newNo++, '+', 'diff-row-add');
+                    if (similar) {{
+                      rDel.contentTd.appendChild(renderLineContent(d.oldOps, 'del'));
+                      rAdd.contentTd.appendChild(renderLineContent(d.newOps, 'add'));
+                    }} else {{
+                      rDel.contentTd.textContent = dels[k];
+                      rAdd.contentTd.textContent = adds[k];
+                    }}
+                    tbody.appendChild(rDel.tr);
+                    tbody.appendChild(rAdd.tr);
+                  }}
+                  for (k = pairCount; k < dels.length; k++) {{
+                    var rd = makeRow(oldNo++, '', '-', 'diff-row-del');
+                    rd.contentTd.textContent = dels[k];
+                    tbody.appendChild(rd.tr);
+                  }}
+                  for (k = pairCount; k < adds.length; k++) {{
+                    var ra = makeRow('', newNo++, '+', 'diff-row-add');
+                    ra.contentTd.textContent = adds[k];
+                    tbody.appendChild(ra.tr);
+                  }}
+                  continue;
+                }}
+
+                if (i >= lines.length) {{ break; }}
+                if (lines[i].charAt(0) === '\\\\') {{ i++; continue; }}
+                var ctx = lines[i];
+                var content = ctx.length ? ctx.slice(1) : '';
+                var rc = makeRow(oldNo++, newNo++, '', '');
+                rc.contentTd.textContent = content;
+                ctxBuffer.push(rc.tr);
+                i++;
+              }}
+              flushContext(ctxBuffer, tbody);
+            }}
+
+            if (!sawHunk) {{
+              var empty = document.createElement('div');
+              empty.className = 'diff-empty subtle';
+              empty.textContent = 'No changes to display.';
+              wrap.appendChild(empty);
+              return wrap;
+            }}
+
+            wrap.appendChild(table);
+            return wrap;
+          }}
+
+          list.querySelectorAll('.changed-pages-item').forEach(wireSelect);
+
+          var initialSelect = {json.dumps(selected_page)};
+          var initialItem = null;
+          if (initialSelect) {{
+            list.querySelectorAll('.changed-pages-item').forEach(function(li) {{
+              if (!initialItem && li.dataset.path === initialSelect) {{ initialItem = li; }}
+            }});
+          }}
+          var firstItem = initialItem || list.querySelector('.changed-pages-item');
+          if (firstItem) {{ selectFile(firstItem); }}
         }})();
         </script>
         """
-        self._send_html(HTTPStatus.OK, html_page(f"Changed pages — {html.escape(name_raw)}", body))
+        self._send_html(
+            HTTPStatus.OK,
+            html_page(f"Changed pages — {html.escape(name_raw)}", body, embed=embed),
+        )
 

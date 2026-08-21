@@ -186,8 +186,21 @@ def build_url(tag: str, path: str = "/", base: str | None = None) -> str:
     return f"{root}{build_path(tag, path)}"
 
 
-def html_page(title: str, body: str, auto_refresh: int | None = None) -> str:
+def html_page(title: str, body: str, auto_refresh: int | None = None, embed: bool = False) -> str:
     refresh = f'  <meta http-equiv="refresh" content="{auto_refresh}">\n' if auto_refresh else ""
+    header = (
+        ""
+        if embed
+        else """<header class="topbar">
+    <nav class="nav">
+      <a href="/previews">Previews</a>
+      <a href="/comments">Comments</a>
+      <a href="/logs">Logs</a>
+    </nav>
+  </header>
+  """
+    )
+    main_class = "app-shell app-shell-embed" if embed else "app-shell"
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -197,14 +210,7 @@ def html_page(title: str, body: str, auto_refresh: int | None = None) -> str:
   <link rel="stylesheet" href="/_review/assets/app.css">
 </head>
 <body>
-  <header class="topbar">
-    <nav class="nav">
-      <a href="/previews">Previews</a>
-      <a href="/comments">Comments</a>
-      <a href="/logs">Logs</a>
-    </nav>
-  </header>
-  <main class="app-shell">
+  {header}<main class="{main_class}">
     {body}
   </main>
 </body>

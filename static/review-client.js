@@ -25,11 +25,8 @@
   let reviewerHelp = null;
   let pendingReviewerAction = null;
   let reviewerBadge = null;
-  let changedPagesSection = null;
-  let changedPagesVisible = false;
-  let diffSection = null;
-  let diffVisible = false;
-  let diffLoaded = false;
+  let diffModalOverlay = null;
+  let diffModalIframe = null;
 
   assignLineNumbers();
   panel = createPanel();
@@ -45,6 +42,12 @@
   document.addEventListener("click", onDocumentClick);
   window.addEventListener("scroll", onViewportChanged, true);
   window.addEventListener("resize", onViewportChanged);
+  // A link to a comment on the page already loaded here only changes the
+  // hash (no full reload), so re-run the jump-to-comment logic by hand —
+  // otherwise it only ever fires once, on the initial page load.
+  window.addEventListener("hashchange", function () {
+    renderComments(commentsCache);
+  });
 
   function assignLineNumbers() {
     let index = 1;
@@ -418,22 +421,16 @@
         <div class="review-panel-head">
           <h2>Comments</h2>
           <div class="review-panel-head-actions">
-            ${ctx.hasDiff ? `<button type="button" class="review-icon-button" id="review-diff-btn" title="View diff for this page" aria-label="View diff for this page">
+            ${ctx.changedPages && ctx.changedPages.length ? `<button type="button" class="review-icon-button" id="review-diff-btn" title="Diff and changed pages" aria-label="Diff and changed pages">
               <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                 <path d="M12 3v18"></path><path d="M5 10l-3 3 3 3"></path><path d="M19 10l3 3-3 3"></path>
               </svg>
             </button>` : ""}
-            ${ctx.changedPages && ctx.changedPages.length ? `<button type="button" class="review-icon-button" id="review-changed-pages-btn" title="Changed pages" aria-label="Changed pages">
-              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                <path d="M8 6h13"></path><path d="M8 12h13"></path><path d="M8 18h13"></path>
-                <path d="M3 6h.01"></path><path d="M3 12h.01"></path><path d="M3 18h.01"></path>
-              </svg>
-            </button>` : ""}
-            <a class="review-icon-button" id="review-view-all-comments" href="/comments?build_id=${encodeURIComponent(String(ctx.buildId))}" target="_blank" rel="noreferrer" title="View all comments" aria-label="View all comments">
+            <button type="button" class="review-icon-button" id="review-view-all-comments" title="View all comments" aria-label="View all comments">
               <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                 <path d="M21 12a8.5 8.5 0 0 1-8.5 8.5H6l-3 3v-6.5A8.5 8.5 0 1 1 21 12z"></path>
               </svg>
-            </a>
+            </button>
             <button type="button" class="review-icon-button" id="review-change-reviewer" title="Change reviewer name" aria-label="Change reviewer name">
               <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                 <path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8z"></path>
@@ -461,8 +458,6 @@
           </div>
           <span class="review-current-reviewer" id="review-current-reviewer">Reviewer: not set</span>
         </div>
-        <div id="review-changed-pages-section" hidden></div>
-        <div id="review-diff-section" hidden></div>
         <div class="review-comment-hint">Highlight text on the page to add comments.</div>
         <div id="review-panel-body">Loading...</div>
       </div>
@@ -513,109 +508,83 @@
       });
     }
 
-    changedPagesSection = aside.querySelector("#review-changed-pages-section");
-    if (changedPagesSection && ctx.changedPages && ctx.changedPages.length) {
-      var countEl = document.createElement("div");
-      countEl.className = "review-changed-pages-count";
-      countEl.textContent = ctx.changedPages.length + " changed page" + (ctx.changedPages.length !== 1 ? "s" : "");
-      changedPagesSection.appendChild(countEl);
-      var list = document.createElement("ul");
-      list.className = "review-changed-pages-list";
-      ctx.changedPages.forEach(function (path) {
-        var isCurrent = path === ctx.pagePath;
-        var li = document.createElement("li");
-        if (isCurrent) { li.className = "is-current"; }
-        var a = document.createElement("a");
-        a.href = "/" + ctx.buildTag + path;
-        a.textContent = path;
-        li.appendChild(a);
-        if (isCurrent) {
-          var badge = document.createElement("span");
-          badge.className = "review-current-page-badge";
-          badge.textContent = "current";
-          li.appendChild(badge);
-        }
-        list.appendChild(li);
-      });
-      changedPagesSection.appendChild(list);
-    }
-
-    var changedPagesBtn = aside.querySelector("#review-changed-pages-btn");
-    if (changedPagesBtn) {
-      changedPagesBtn.addEventListener("click", toggleChangedPagesView);
-    }
-
-    diffSection = aside.querySelector("#review-diff-section");
     var diffBtn = aside.querySelector("#review-diff-btn");
     if (diffBtn) {
-      diffBtn.addEventListener("click", toggleDiffView);
+      diffBtn.addEventListener("click", openDiffModal);
+    }
+
+    var viewAllCommentsBtn = aside.querySelector("#review-view-all-comments");
+    if (viewAllCommentsBtn) {
+      viewAllCommentsBtn.addEventListener("click", openCommentsModal);
     }
 
     return aside;
   }
 
-  function toggleChangedPagesView() {
-    changedPagesVisible = !changedPagesVisible;
-    if (changedPagesSection) {
-      changedPagesSection.hidden = !changedPagesVisible;
-    }
-    var btn = panel && panel.querySelector("#review-changed-pages-btn");
-    if (btn) { btn.classList.toggle("is-active", changedPagesVisible); }
-  }
-
-  function toggleDiffView() {
-    diffVisible = !diffVisible;
-    if (diffSection) {
-      diffSection.hidden = !diffVisible;
-    }
-    var btn = panel && panel.querySelector("#review-diff-btn");
-    if (btn) { btn.classList.toggle("is-active", diffVisible); }
-    if (diffVisible && !diffLoaded) {
-      loadDiff();
-    }
-  }
-
-  async function loadDiff() {
-    if (!diffSection) {
+  function ensureModal() {
+    if (diffModalOverlay) {
       return;
     }
-    diffSection.innerHTML = '<div class="review-diff-loading">Loading diff…</div>';
-    var url = "/api/builds/" + encodeURIComponent(String(ctx.buildId)) + "/page-diff?page=" + encodeURIComponent(ctx.pagePath);
-    try {
-      var response = await fetch(url);
-      if (!response.ok) {
-        diffSection.innerHTML = '<div class="review-diff-error">Diff not available.</div>';
-        return;
+    diffModalOverlay = document.createElement("div");
+    diffModalOverlay.className = "review-diff-modal-overlay";
+    diffModalOverlay.hidden = true;
+    diffModalOverlay.innerHTML = `
+      <div class="review-diff-modal">
+        <div class="review-diff-modal-head">
+          <span class="review-diff-modal-title"></span>
+          <button type="button" class="review-diff-modal-close" aria-label="Close">&times;</button>
+        </div>
+        <iframe class="review-diff-modal-iframe" title="Preview modal"></iframe>
+      </div>
+    `;
+    document.body.appendChild(diffModalOverlay);
+    diffModalIframe = diffModalOverlay.querySelector(".review-diff-modal-iframe");
+    diffModalOverlay.querySelector(".review-diff-modal-close").addEventListener("click", closeModal);
+    diffModalOverlay.addEventListener("click", function (event) {
+      if (event.target === diffModalOverlay) {
+        closeModal();
       }
-      var text = await response.text();
-      diffLoaded = true;
-      diffSection.innerHTML = "";
-      diffSection.appendChild(renderDiff(text));
-    } catch (err) {
-      diffSection.innerHTML = '<div class="review-diff-error">Failed to load diff.</div>';
+    });
+    document.addEventListener("keydown", function (event) {
+      if (event.key === "Escape" && diffModalOverlay && !diffModalOverlay.hidden) {
+        closeModal();
+      }
+    });
+  }
+
+  function openModal(title, url) {
+    ensureModal();
+    diffModalOverlay.querySelector(".review-diff-modal-title").textContent = title;
+    diffModalIframe.title = title;
+    diffModalIframe.src = url;
+    diffModalOverlay.hidden = false;
+  }
+
+  function closeModal() {
+    if (diffModalOverlay) {
+      diffModalOverlay.hidden = true;
+    }
+    if (diffModalIframe) {
+      diffModalIframe.src = "about:blank";
     }
   }
 
-  function renderDiff(text) {
-    var pre = document.createElement("pre");
-    pre.className = "review-diff-content";
-    text.split("\n").forEach(function (line) {
-      var span = document.createElement("span");
-      span.className = "review-diff-line";
-      if (line.startsWith("+++") || line.startsWith("---")) {
-        span.classList.add("review-diff-header");
-      } else if (line.startsWith("+")) {
-        span.classList.add("review-diff-add");
-      } else if (line.startsWith("-")) {
-        span.classList.add("review-diff-del");
-      } else if (line.startsWith("@@")) {
-        span.classList.add("review-diff-hunk");
-      }
-      span.textContent = line;
-      pre.appendChild(span);
-      pre.appendChild(document.createTextNode("\n"));
-    });
-    return pre;
+  // Exposed so the same-origin iframes we open (changed-pages, comments) can
+  // close us before navigating — otherwise a link to a page/anchor that's
+  // already loaded here doesn't trigger a full reload, and this fixed,
+  // full-screen overlay is left covering the page with nothing visibly
+  // happening.
+  window.__reviewCloseModal = closeModal;
+
+  function openDiffModal() {
+    var url = "/previews/" + encodeURIComponent(String(ctx.buildId)) + "/changed-pages?embed=1&select="
+      + encodeURIComponent(ctx.pagePath);
+    openModal("Changed pages", url);
+  }
+
+  function openCommentsModal() {
+    var url = "/comments?embed=1&build_id=" + encodeURIComponent(String(ctx.buildId));
+    openModal("Comments", url);
   }
 
   function onViewportChanged() {

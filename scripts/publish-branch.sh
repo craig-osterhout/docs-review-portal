@@ -102,7 +102,9 @@ if [ -d "$DOCS_DIR/content" ] && git -C "$DOCS_DIR" rev-parse --git-dir >/dev/nu
     PAGE_PATH="$(printf '%s' "$FILE" | sed 's|^content||; s|/_index\.md$|/|; s|/index\.md$|/|; s|\.md$|/|; s|^/manuals/|/|')"
     DIFF_FILE="$(printf '%s' "$PAGE_PATH" | sed 's|/$|/index.html|; s|^/||')"
     mkdir -p "$DOCS_DIR/$OUT_REL/.diffs/$(dirname "$DIFF_FILE")"
-    git -C "$DOCS_DIR" diff "$MERGE_BASE" -- "$FILE" > "$DOCS_DIR/$OUT_REL/.diffs/$DIFF_FILE"
+    # Full-file context (not git's default 3 lines) so the review UI can let
+    # reviewers expand into unchanged source around each change.
+    git -C "$DOCS_DIR" diff "$MERGE_BASE" --unified=100000 -- "$FILE" > "$DOCS_DIR/$OUT_REL/.diffs/$DIFF_FILE"
   done
   printf 'Done.\n' >&2
 fi

@@ -66,7 +66,7 @@ class ReviewHandler(
             self._export_preview_comments_csv(path)
             return
         if re.match(r"^/(?:publications|previews)/\d+/changed-pages$", path):
-            self._render_changed_pages_page(path)
+            self._render_changed_pages_page(path, query)
             return
         if path == "/previews":
             self._render_previews_page()

@@ -40,6 +40,11 @@ a {
   padding: 24px 20px 40px;
 }
 
+.app-shell-embed {
+  max-width: none;
+  padding: 12px;
+}
+
 .panel {
   border: 1px solid #d9e2ef;
   border-radius: 10px;
@@ -437,40 +442,251 @@ blockquote {
   background: #f8fbff;
 }
 
-/* Changed pages list */
-.changed-pages-list {
+/* Changed pages: file tree */
+.changed-pages-list,
+.tree-children {
   list-style: none;
   padding: 0;
-  margin: 12px 0 0;
+  margin: 0;
 }
-.changed-pages-list li {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 0;
-  border-bottom: 1px solid #eef2f7;
+.changed-pages-list {
+  margin-top: 12px;
+}
+.tree-children {
+  padding-left: 14px;
+}
+.tree-dir-label {
+  padding: 4px 0;
+  font-weight: 600;
+  color: #3b4d64;
   font-family: var(--font-mono, monospace);
   font-size: 0.87rem;
 }
-.changed-pages-list li:last-child {
-  border-bottom: none;
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  font-family: var(--font-mono, monospace);
+  font-size: 0.87rem;
 }
-.changed-pages-list li a {
+/* Changed pages: two-pane diff view */
+.diff-page-layout {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  margin-top: 12px;
+}
+
+.diff-sidebar {
+  width: 320px;
+  flex-shrink: 0;
+}
+
+.diff-viewer {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid #d9e2ef;
+  border-radius: 8px;
+  background: #ffffff;
+  overflow: hidden;
+}
+
+.changed-pages-item.is-selected {
+  background: #eef4fd;
+  border-radius: 6px;
+}
+
+.file-select-btn {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  padding: 2px 4px;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+
+.file-select-btn:hover .file-path {
+  text-decoration: underline;
+}
+
+.file-path {
   flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.remove-page-btn {
+
+.file-status-badge {
   flex-shrink: 0;
-  width: 22px;
-  height: 22px;
-  padding: 0;
-  font-size: 14px;
-  line-height: 1;
-  opacity: 0.5;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  font-family: sans-serif;
 }
-.remove-page-btn:hover {
-  opacity: 1;
+
+.file-status-badge.status-modified {
+  background: rgba(31, 111, 235, 0.15);
+  color: #1f6feb;
+}
+
+.file-status-badge.status-added {
+  background: rgba(34, 197, 94, 0.18);
+  color: #1a7f37;
+}
+
+.open-preview-link {
+  flex-shrink: 0;
+  width: auto;
+  height: auto;
+  min-width: 0;
+  border: none;
+  background: none;
+  border-radius: 0;
+  padding: 0;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.open-preview-link:hover,
+.open-preview-link:focus-visible {
+  border: none;
+  background: none;
+}
+
+.diff-empty,
+.diff-loading,
+.diff-error {
+  padding: 24px;
+}
+
+.diff-error {
+  color: #a3471b;
+}
+
+.diff-file-title {
+  padding: 8px 12px;
+  border-bottom: 1px solid #d9e2ef;
+  background: #f6f8fa;
+  font-family: var(--font-mono, monospace);
+  font-size: 0.85rem;
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.diff-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono, monospace);
+  font-size: 0.78rem;
+}
+
+.diff-table td {
+  padding: 1px 8px;
+  vertical-align: top;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.diff-line-no {
+  width: 42px;
+  text-align: right;
+  color: #8a94a6;
+  user-select: none;
+}
+
+.diff-marker {
+  width: 18px;
+  text-align: center;
+  user-select: none;
+  color: #8a94a6;
+}
+
+.diff-row-add {
+  background: #e6ffec;
+}
+.diff-row-add .diff-line-no {
+  background: #cdffd8;
+}
+.diff-row-add .diff-marker {
+  color: #1a7f37;
+}
+
+.diff-row-del {
+  background: #ffebe9;
+}
+.diff-row-del .diff-line-no {
+  background: #ffd7d5;
+}
+.diff-row-del .diff-marker {
+  color: #cf222e;
+}
+
+.diff-row-hunk td {
+  background: #f1f8ff;
+  color: #586069;
+  padding: 4px 8px;
+  font-weight: 600;
+}
+
+.diff-word-add {
+  background: #abf2bc;
+  border-radius: 2px;
+}
+
+.diff-word-del {
+  background: #ffb3ba;
+  border-radius: 2px;
+}
+
+.diff-row-expand td {
+  background: #f6f8fa;
+  padding: 0;
+}
+
+.diff-expand-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 3px 8px;
+  border: none;
+  background: none;
+  color: #586069;
+  font: inherit;
+  font-size: 0.75rem;
+  cursor: pointer;
+  text-align: left;
+}
+
+.diff-expand-btn:hover {
+  background: #eef4ff;
+  color: #0b5fd3;
+}
+
+.diff-expand-icons {
+  font-size: 10px;
+  line-height: 1;
+  letter-spacing: -2px;
+}
+
+@media (max-width: 900px) {
+  .diff-page-layout {
+    flex-direction: column;
+  }
+  .diff-sidebar {
+    width: 100%;
+  }
 }
