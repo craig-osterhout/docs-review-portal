@@ -106,7 +106,7 @@ class ReviewPagesMixin:
                 <tr{row_class}>
                   <td>{preview_display}</td>
                   <td>{format_ts(updated_at)}</td>
-                  <td><a href="{build_url(tag_raw, base=self._public_base())}" target="_blank" rel="noreferrer">View preview</a><br>
+                  <td><a href="{build_url(tag_raw, base=self._public_base())}">View preview</a><br>
                       <span class="subtle">{urlparse(self._public_base()).netloc}{build_path(tag_raw)}</span></td>
                   <td><a href="/comments?build_id={build_id}">{open_comments} open / {comments} total</a></td>
                   <td>
@@ -370,8 +370,10 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
         comment_rows: list[str] = []
         for comment in comments:
             resolved_label = "resolved" if comment["resolved"] else "open"
+            is_diff_comment = comment.get("kind") == "diff"
             location = build_url(str(comment["build_tag"]), str(comment["page_path"]), base=self._public_base())
-            location = f"{location}#review-comment-{comment['id']}"
+            hash_fragment = "review-diff-comment" if is_diff_comment else "review-comment"
+            location = f"{location}#{hash_fragment}-{comment['id']}"
             archived_raw = comment.get("build_archived_at")
             archived_at = int(archived_raw) if archived_raw is not None else None
             delete_at = compute_delete_at(archived_at)
@@ -395,19 +397,24 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
                 status_badges.append('<span class="status archived">pending delete</span>')
             status_markup = " ".join(status_badges)
 
+            page_meta = (
+                '<div class="subtle">diff comment</div>'
+                if is_diff_comment
+                else f"<div class=\"subtle\">lines {comment.get('line_start') or '-'} - {comment.get('line_end') or '-'}</div>"
+            )
             comment_rows.append(
                 f"""
                 <tr id="review-comment-{comment['id']}"{row_class}>
                   <td>{preview_label}</td>
                   <td>
-                    <a class="comment-page-link" href="{html.escape(location)}" target="_blank" rel="noreferrer">{html.escape(str(comment['page_path']))}</a>
-                    <div class="subtle">lines {comment.get('line_start') or '-'} - {comment.get('line_end') or '-'}</div>
+                    <a class="comment-page-link" href="{html.escape(location)}">{html.escape(str(comment['page_path']))}</a>
+                    {page_meta}
                   </td>
                   <td>{html.escape(str(comment['reviewer']))}</td>
                   <td>{comment['created_at_human']}</td>
                   <td>{status_markup}</td>
                   <td>
-                    <a class="comment-page-link" href="{html.escape(location)}" target="_blank" rel="noreferrer">{html.escape(str(comment['body']))}</a>
+                    <a class="comment-page-link" href="{html.escape(location)}">{html.escape(str(comment['body']))}</a>
                     {f"<blockquote>{html.escape(str(comment['selected_text']))}</blockquote>" if comment.get('selected_text') else ""}
                   </td>
                 </tr>
@@ -571,6 +578,9 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
                     selected_page = p
                     break
 
+        highlight_raw = (query.get("highlight", [""])[0] or "").strip()
+        highlight_comment_id = int(highlight_raw) if highlight_raw.isdigit() else None
+
         def build_page_tree(paths: list[str]) -> dict:
             root: dict = {}
             for p in paths:
@@ -597,7 +607,7 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
                 <span class="file-status-badge {status_cls}" title="{status_title}">{status_label}</span>
                 <span class="file-path">{label_esc}</span>
               </button>
-              <a class="icon-action open-preview-link" href="{preview_link}" target="_blank" rel="noreferrer" title="Open preview" aria-label="Open preview for {p_esc}">&#8599;</a>"""
+              <a class="icon-action open-preview-link" href="{preview_link}" title="Open preview" aria-label="Open preview for {p_esc}">&#8599;</a>"""
 
         def render_tree(node: dict) -> str:
             dirs = sorted((seg for seg, e in node.items() if e["children"]))
@@ -649,18 +659,57 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
             </div>
           </div>
         </section>
+        {"" if embed else f'''<script>
+          window.REVIEW_CONTEXT = {{
+            mode: "diff",
+            buildId: {build_id},
+            buildTag: {json.dumps(tag)},
+            pagePath: {json.dumps(selected_page)},
+          }};
+        </script>
+        <link rel="stylesheet" href="/_review/assets/review.css">
+        <script defer src="/_review/assets/review-client.js"></script>'''}
         <script>
         (function() {{
           var BUILD_ID = {build_id};
           var tag = {json.dumps(tag)};
           var baseUrl = {json.dumps(self._public_base())};
           var EMBED = {json.dumps(embed)};
+          var HIGHLIGHT_COMMENT_ID = {json.dumps(highlight_comment_id)};
+          var REVIEWER_KEY = 'docs-review-reviewer';
+          var HAS_PARENT_WIDGET = EMBED && window.parent && window.parent !== window;
           var list = document.getElementById('changed-pages-list');
           var diffViewer = document.getElementById('diff-viewer');
           var activePath = null;
 
-          if (EMBED && window.parent && window.parent !== window) {{
-            list.addEventListener('click', function(e) {{
+          // Per-render diff-comment state — reset at the top of each renderDiff() call.
+          var rowsByKey = {{}};
+          var orderedKeys = [];
+
+          function getReviewerName() {{
+            try {{ return (window.sessionStorage.getItem(REVIEWER_KEY) || '').trim(); }} catch (_) {{ return ''; }}
+          }}
+
+          function setReviewerName(name) {{
+            try {{ window.sessionStorage.setItem(REVIEWER_KEY, name); }} catch (_) {{}}
+          }}
+
+          // The comments list itself lives in a review-client.js widget — the
+          // preview page's own widget when this is embedded in its modal, or a
+          // local one loaded on this same page when viewed standalone (see
+          // below). Either way it calls back in here to reveal a specific row,
+          // and we call back out to it after changing pages or adding a
+          // comment, so it always reflects whichever file is open here.
+          function notifyParentActivePage(pagePath) {{
+            if (HAS_PARENT_WIDGET && window.parent.__reviewSetActivePage) {{
+              window.parent.__reviewSetActivePage(pagePath);
+            }} else if (!EMBED && window.__reviewSetActivePage) {{
+              window.__reviewSetActivePage(pagePath);
+            }}
+          }}
+
+          if (HAS_PARENT_WIDGET) {{
+            document.addEventListener('click', function(e) {{
               var link = e.target.closest && e.target.closest('.open-preview-link');
               if (!link) {{ return; }}
               e.preventDefault();
@@ -693,7 +742,8 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
             if (li.scrollIntoView) {{ li.scrollIntoView({{block: 'nearest'}}); }}
             if (li.dataset.hasDiff !== '1') {{
               diffViewer.innerHTML = '<div class="diff-empty subtle"><em>No diff available for this page &mdash; it looks like a new page.</em><br>'
-                + '<a href="' + escHtml(buildUrlFor(pagePath)) + '" target="_blank" rel="noreferrer">Open preview</a></div>';
+                + '<a class="open-preview-link" href="' + escHtml(buildUrlFor(pagePath)) + '">Open preview</a></div>';
+              notifyParentActivePage(pagePath);
               return;
             }}
             diffViewer.innerHTML = '<div class="diff-loading subtle">Loading diff&hellip;</div>';
@@ -706,11 +756,32 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
                 if (activePath !== pagePath) {{ return; }}
                 diffViewer.innerHTML = '';
                 diffViewer.appendChild(renderDiff(text, pagePath));
+                // renderDiff() must finish first — it (re)populates rowsByKey,
+                // which the parent widget highlights rows against once it
+                // calls back into __applyCommentHighlights.
+                notifyParentActivePage(pagePath);
+                if (HIGHLIGHT_COMMENT_ID) {{
+                  var targetId = HIGHLIGHT_COMMENT_ID;
+                  HIGHLIGHT_COMMENT_ID = null;
+                  revealCommentById(pagePath, targetId);
+                }}
               }})
               .catch(function() {{
                 if (activePath !== pagePath) {{ return; }}
                 diffViewer.innerHTML = '<div class="diff-error subtle">Failed to load diff.</div>';
+                notifyParentActivePage(pagePath);
               }});
+          }}
+
+          function revealCommentById(pagePath, commentId) {{
+            fetch('/api/comments?build_id=' + BUILD_ID + '&page_path=' + encodeURIComponent(pagePath))
+              .then(function(r) {{ return r.ok ? r.json() : {{comments: []}}; }})
+              .then(function(data) {{
+                if (activePath !== pagePath) {{ return; }}
+                var target = (data.comments || []).filter(function(c) {{ return Number(c.id) === Number(commentId); }})[0];
+                if (target) {{ window.__revealAndScrollToDiffKey(target.diff_start_key) || window.__revealAndScrollToDiffKey(target.diff_end_key); }}
+              }})
+              .catch(function() {{}});
           }}
 
           // ---- word-level diff (LCS over whitespace-separated tokens) ----
@@ -759,9 +830,22 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
             return frag;
           }}
 
+          function diffLineKey(oldNo, newNo) {{
+            if (oldNo && newNo) {{ return oldNo + ':' + newNo; }}
+            if (oldNo) {{ return 'o' + oldNo; }}
+            if (newNo) {{ return 'n' + newNo; }}
+            return '';
+          }}
+
           function makeRow(oldNo, newNo, marker, rowClass) {{
             var tr = document.createElement('tr');
             if (rowClass) {{ tr.className = rowClass; }}
+            var key = diffLineKey(oldNo, newNo);
+            if (key) {{
+              tr.dataset.diffKey = key;
+              rowsByKey[key] = tr;
+              orderedKeys.push(key);
+            }}
             var oldTd = document.createElement('td'); oldTd.className = 'diff-line-no'; oldTd.textContent = oldNo || '';
             var newTd = document.createElement('td'); newTd.className = 'diff-line-no'; newTd.textContent = newNo || '';
             var markTd = document.createElement('td'); markTd.className = 'diff-marker'; markTd.textContent = marker || '';
@@ -772,10 +856,20 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
 
           var DIFF_EDGE_CONTEXT = 3;
           var DIFF_COLLAPSE_MIN_HIDDEN = 3;
+          var diffHiddenGroupCounter = 0;
 
-          function makeExpandRow(hiddenTrs) {{
+          function expandHiddenGroup(groupId) {{
+            document.querySelectorAll('[data-diff-hidden-group="' + groupId + '"].diff-row-hidden').forEach(function(el) {{
+              el.classList.remove('diff-row-hidden');
+            }});
+            var expandRow = document.querySelector('.diff-row-expand[data-diff-hidden-group="' + groupId + '"]');
+            if (expandRow) {{ expandRow.remove(); }}
+          }}
+
+          function makeExpandRow(hiddenTrs, groupId) {{
             var tr = document.createElement('tr');
             tr.className = 'diff-row-expand';
+            tr.dataset.diffHiddenGroup = String(groupId);
             var td = document.createElement('td');
             td.colSpan = 4;
             var btn = document.createElement('button');
@@ -788,15 +882,16 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
             btn.appendChild(document.createTextNode(
               'Show ' + hiddenTrs.length + ' unchanged line' + (hiddenTrs.length === 1 ? '' : 's')
             ));
-            btn.addEventListener('click', function() {{
-              hiddenTrs.forEach(function(hiddenTr) {{ tr.parentNode.insertBefore(hiddenTr, tr); }});
-              tr.remove();
-            }});
+            btn.addEventListener('click', function() {{ expandHiddenGroup(groupId); }});
             td.appendChild(btn);
             tr.appendChild(td);
             return tr;
           }}
 
+          // Collapsed rows stay in the DOM (just hidden via CSS) instead of
+          // being detached into a JS-side array — that way review-client.js
+          // can find and reveal a specific commented row with a plain DOM
+          // query, with no coupling back to this page's render-time state.
           function flushContext(buffer, tbody) {{
             if (!buffer.length) {{ return; }}
             var hiddenCount = buffer.length - DIFF_EDGE_CONTEXT * 2;
@@ -808,13 +903,22 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
             var head = buffer.slice(0, DIFF_EDGE_CONTEXT);
             var hidden = buffer.slice(DIFF_EDGE_CONTEXT, buffer.length - DIFF_EDGE_CONTEXT);
             var tail = buffer.slice(buffer.length - DIFF_EDGE_CONTEXT);
+            var groupId = ++diffHiddenGroupCounter;
             head.forEach(function(tr) {{ tbody.appendChild(tr); }});
-            tbody.appendChild(makeExpandRow(hidden));
+            hidden.forEach(function(tr) {{
+              tr.classList.add('diff-row-hidden');
+              tr.dataset.diffHiddenGroup = String(groupId);
+              tbody.appendChild(tr);
+            }});
+            tbody.appendChild(makeExpandRow(hidden, groupId));
             tail.forEach(function(tr) {{ tbody.appendChild(tr); }});
             buffer.length = 0;
           }}
 
           function renderDiff(text, pagePath) {{
+            rowsByKey = {{}};
+            orderedKeys = [];
+
             var wrap = document.createElement('div');
             wrap.className = 'diff-file-wrap';
             var titleBar = document.createElement('div');
@@ -916,7 +1020,178 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
             }}
 
             wrap.appendChild(table);
+            wireDiffSelection(table, pagePath);
             return wrap;
+          }}
+
+          // ---- diff comment row highlighting (comments themselves are owned by the review widget) ----
+
+          function keyRange(startKey, endKey) {{
+            var startIdx = orderedKeys.indexOf(startKey);
+            var endIdx = orderedKeys.indexOf(endKey);
+            if (startIdx === -1 || endIdx === -1) {{ return null; }}
+            if (startIdx > endIdx) {{ var tmp = startIdx; startIdx = endIdx; endIdx = tmp; }}
+            return orderedKeys.slice(startIdx, endIdx + 1);
+          }}
+
+          function applyCommentHighlights(comments) {{
+            document.querySelectorAll('.diff-row-commented, .diff-row-commented-resolved').forEach(function(tr) {{
+              tr.classList.remove('diff-row-commented', 'diff-row-commented-resolved');
+            }});
+            comments.forEach(function(comment) {{
+              var keys = keyRange(comment.diff_start_key, comment.diff_end_key);
+              if (!keys) {{ return; }}
+              keys.forEach(function(key) {{
+                var tr = rowsByKey[key];
+                if (tr) {{ tr.classList.add(comment.resolved ? 'diff-row-commented-resolved' : 'diff-row-commented'); }}
+              }});
+            }});
+          }}
+
+          // Exposed for the parent window's comment widget (review-client.js) to
+          // call into — it owns the comments list, this page only owns the diff.
+          window.__applyCommentHighlights = applyCommentHighlights;
+
+          window.__revealAndScrollToDiffKey = function(key) {{
+            if (!key) {{ return false; }}
+            var row = rowsByKey[key];
+            if (!row) {{ return false; }}
+            if (row.classList.contains('diff-row-hidden')) {{
+              expandHiddenGroup(row.getAttribute('data-diff-hidden-group'));
+            }}
+            row.scrollIntoView({{block: 'center'}});
+            row.classList.add('diff-row-flash');
+            setTimeout(function() {{ row.classList.remove('diff-row-flash'); }}, 2000);
+            return true;
+          }};
+
+          // ---- selection-to-comment floating button + composer ----
+          var floatingAddBtn = null;
+          var diffComposer = null;
+
+          function closestDiffRow(node) {{
+            while (node && node.nodeType !== 1) {{ node = node.parentNode; }}
+            return node && node.closest ? node.closest('tr[data-diff-key]') : null;
+          }}
+
+          function removeFloatingAddBtn() {{
+            if (floatingAddBtn) {{ floatingAddBtn.remove(); floatingAddBtn = null; }}
+          }}
+
+          function removeDiffComposer() {{
+            if (diffComposer) {{ diffComposer.remove(); diffComposer = null; }}
+          }}
+
+          function wireDiffSelection(table, pagePath) {{
+            table.addEventListener('mouseup', function() {{
+              setTimeout(function() {{ handleDiffSelection(table, pagePath); }}, 0);
+            }});
+          }}
+
+          function handleDiffSelection(table, pagePath) {{
+            removeDiffComposer();
+            var selection = window.getSelection();
+            if (!selection || selection.isCollapsed || selection.rangeCount === 0) {{
+              removeFloatingAddBtn();
+              return;
+            }}
+            var range = selection.getRangeAt(0);
+            if (!table.contains(range.commonAncestorContainer)) {{
+              removeFloatingAddBtn();
+              return;
+            }}
+            var startRow = closestDiffRow(range.startContainer);
+            var endRow = closestDiffRow(range.endContainer);
+            if (!startRow || !endRow) {{
+              removeFloatingAddBtn();
+              return;
+            }}
+            var startIdx = orderedKeys.indexOf(startRow.dataset.diffKey);
+            var endIdx = orderedKeys.indexOf(endRow.dataset.diffKey);
+            var startKey = startIdx <= endIdx ? startRow.dataset.diffKey : endRow.dataset.diffKey;
+            var endKey = startIdx <= endIdx ? endRow.dataset.diffKey : startRow.dataset.diffKey;
+            var selectedText = selection.toString();
+
+            removeFloatingAddBtn();
+            var rect = range.getBoundingClientRect();
+            floatingAddBtn = document.createElement('button');
+            floatingAddBtn.type = 'button';
+            floatingAddBtn.className = 'diff-add-comment-btn';
+            floatingAddBtn.textContent = 'Add comment';
+            floatingAddBtn.style.top = Math.max(8, rect.top - 34) + 'px';
+            floatingAddBtn.style.left = Math.max(8, rect.left) + 'px';
+            floatingAddBtn.addEventListener('mousedown', function(e) {{ e.preventDefault(); }});
+            floatingAddBtn.addEventListener('click', function() {{
+              showDiffComposer(rect, pagePath, startKey, endKey, selectedText);
+            }});
+            document.body.appendChild(floatingAddBtn);
+          }}
+
+          function showDiffComposer(rect, pagePath, startKey, endKey, selectedText) {{
+            removeFloatingAddBtn();
+            removeDiffComposer();
+            diffComposer = document.createElement('div');
+            diffComposer.className = 'diff-add-comment-composer';
+            diffComposer.style.top = Math.max(8, rect.bottom + 8) + 'px';
+            diffComposer.style.left = Math.max(8, rect.left) + 'px';
+            diffComposer.innerHTML =
+              '<input type="text" class="diff-composer-reviewer" placeholder="Your name" value="' + escHtml(getReviewerName()) + '">' +
+              '<textarea class="diff-composer-body" placeholder="Leave a comment" rows="3"></textarea>' +
+              '<div class="diff-composer-error subtle" hidden></div>' +
+              '<div class="diff-composer-actions">' +
+                '<button type="button" class="diff-composer-cancel">Cancel</button>' +
+                '<button type="button" class="diff-composer-submit">Comment</button>' +
+              '</div>';
+            document.body.appendChild(diffComposer);
+            var reviewerInput = diffComposer.querySelector('.diff-composer-reviewer');
+            var textarea = diffComposer.querySelector('.diff-composer-body');
+            var errorEl = diffComposer.querySelector('.diff-composer-error');
+            if (getReviewerName()) {{ textarea.focus(); }} else {{ reviewerInput.focus(); }}
+            diffComposer.querySelector('.diff-composer-cancel').addEventListener('click', function() {{
+              removeDiffComposer();
+              window.getSelection().removeAllRanges();
+            }});
+            diffComposer.querySelector('.diff-composer-submit').addEventListener('click', function() {{
+              var reviewer = reviewerInput.value.trim();
+              var body = textarea.value.trim();
+              if (!reviewer) {{
+                errorEl.textContent = 'Enter your name to comment.';
+                errorEl.hidden = false;
+                reviewerInput.focus();
+                return;
+              }}
+              if (!body) {{
+                errorEl.textContent = 'Comment text is required.';
+                errorEl.hidden = false;
+                textarea.focus();
+                return;
+              }}
+              setReviewerName(reviewer);
+              fetch('/api/comments', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{
+                  build_id: BUILD_ID,
+                  page_path: pagePath,
+                  reviewer: reviewer,
+                  body: body,
+                  selected_text: selectedText,
+                  kind: 'diff',
+                  diff_start_key: startKey,
+                  diff_end_key: endKey,
+                }}),
+              }})
+                .then(function(r) {{ return r.json(); }})
+                .then(function(data) {{
+                  removeDiffComposer();
+                  window.getSelection().removeAllRanges();
+                  if (data.error) {{ window.alert(data.error); return; }}
+                  // Triggers the parent widget's refreshComments(), which calls
+                  // back into __applyCommentHighlights with the full, correct list.
+                  notifyParentActivePage(pagePath);
+                }})
+                .catch(function() {{ window.alert('Failed to save comment.'); }});
+            }});
           }}
 
           list.querySelectorAll('.changed-pages-item').forEach(wireSelect);
@@ -929,7 +1204,18 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
             }});
           }}
           var firstItem = initialItem || list.querySelector('.changed-pages-item');
-          if (firstItem) {{ selectFile(firstItem); }}
+          if (firstItem) {{
+            // The standalone (non-embed) case loads its own review-client.js
+            // widget, which reads window.REVIEW_CONTEXT.pagePath once,
+            // synchronously, as soon as its deferred script runs — before
+            // selectFile()'s own async fetch would otherwise get around to
+            // setting it via notifyParentActivePage(). Set it now so the
+            // widget doesn't bail out for lacking a page path on first load.
+            if (!EMBED && window.REVIEW_CONTEXT) {{
+              window.REVIEW_CONTEXT.pagePath = firstItem.dataset.path;
+            }}
+            selectFile(firstItem);
+          }}
         }})();
         </script>
         """

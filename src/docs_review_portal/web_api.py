@@ -266,6 +266,9 @@ class ReviewApiMixin:
             line_start = payload.get("line_start")
             line_end = payload.get("line_end")
             parent_id = payload.get("parent_id")
+            kind = str(payload.get("kind") or "preview")
+            diff_start_key = payload.get("diff_start_key")
+            diff_end_key = payload.get("diff_end_key")
             if line_start is not None:
                 line_start = int(line_start)
             if line_end is not None:
@@ -282,6 +285,9 @@ class ReviewApiMixin:
                 line_end=line_end,
                 selection=selection,
                 parent_id=parent_id,
+                kind=kind,
+                diff_start_key=str(diff_start_key) if diff_start_key else None,
+                diff_end_key=str(diff_end_key) if diff_end_key else None,
             )
         except Exception as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})

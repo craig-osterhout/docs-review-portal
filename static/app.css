@@ -682,6 +682,82 @@ blockquote {
   letter-spacing: -2px;
 }
 
+/* Diff comments: row highlights, panel, and the selection composer */
+.diff-row-commented td {
+  box-shadow: inset 3px 0 0 #d4a72c;
+  background-color: rgba(212, 167, 44, 0.08);
+}
+
+.diff-row-commented-resolved td {
+  box-shadow: inset 3px 0 0 #8a94a6;
+}
+
+.diff-row-flash td {
+  animation: diff-row-flash-anim 2s ease-out;
+}
+
+@keyframes diff-row-flash-anim {
+  from { background-color: rgba(31, 115, 229, 0.35); }
+  to { background-color: transparent; }
+}
+
+.diff-row-hidden {
+  display: none;
+}
+
+.diff-add-comment-btn {
+  position: fixed;
+  z-index: 2000;
+  border: 1px solid #1f73e5;
+  background: #1f73e5;
+  color: #fff;
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+
+.diff-add-comment-composer {
+  position: fixed;
+  z-index: 2000;
+  width: 260px;
+  background: #fff;
+  border: 1px solid #d9e2ef;
+  border-radius: 8px;
+  padding: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.diff-composer-reviewer,
+.diff-composer-body {
+  width: 100%;
+  font-size: 0.82rem;
+}
+
+.diff-composer-body {
+  resize: vertical;
+}
+
+.diff-composer-error {
+  color: #a3471b;
+  font-size: 0.76rem;
+  margin: -4px 0 0;
+}
+
+.diff-composer-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.diff-composer-actions button {
+  font-size: 0.8rem;
+  padding: 4px 10px;
+}
+
 @media (max-width: 900px) {
   .diff-page-layout {
     flex-direction: column;

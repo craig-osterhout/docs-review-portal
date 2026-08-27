@@ -556,6 +556,12 @@ def init_storage() -> None:
             comment_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(comments)").fetchall()}
             if "selection_json" not in comment_columns:
                 conn.execute("ALTER TABLE comments ADD COLUMN selection_json TEXT")
+            if "kind" not in comment_columns:
+                conn.execute("ALTER TABLE comments ADD COLUMN kind TEXT NOT NULL DEFAULT 'preview'")
+            if "diff_start_key" not in comment_columns:
+                conn.execute("ALTER TABLE comments ADD COLUMN diff_start_key TEXT")
+            if "diff_end_key" not in comment_columns:
+                conn.execute("ALTER TABLE comments ADD COLUMN diff_end_key TEXT")
         else:
             conn.executescript(
                 """
@@ -596,6 +602,9 @@ def init_storage() -> None:
                 ALTER TABLE builds ADD COLUMN IF NOT EXISTS changed_pages TEXT;
                 ALTER TABLE builds ADD COLUMN IF NOT EXISTS diff_pages TEXT;
                 ALTER TABLE comments ADD COLUMN IF NOT EXISTS selection_json TEXT;
+                ALTER TABLE comments ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'preview';
+                ALTER TABLE comments ADD COLUMN IF NOT EXISTS diff_start_key TEXT;
+                ALTER TABLE comments ADD COLUMN IF NOT EXISTS diff_end_key TEXT;
 
                 CREATE TABLE IF NOT EXISTS page_diffs (
                     id BIGSERIAL PRIMARY KEY,
@@ -1291,7 +1300,12 @@ def create_comment(
     line_end: int | None = None,
     selection: dict[str, Any] | None = None,
     parent_id: int | None = None,
+    kind: str = "preview",
+    diff_start_key: str | None = None,
+    diff_end_key: str | None = None,
 ) -> int:
+    if kind not in ("preview", "diff"):
+        raise ValueError("kind must be 'preview' or 'diff'")
     with db_connect() as conn:
         if parent_id is not None:
             parent = conn.execute("SELECT * FROM comments WHERE id = ?", (parent_id,)).fetchone()
@@ -1299,6 +1313,9 @@ def create_comment(
                 raise ValueError("parent comment not found")
             build_id = int(parent["build_id"])
             page_path = str(parent["page_path"])
+            kind = str(parent["kind"]) if "kind" in parent.keys() and parent["kind"] else "preview"
+            diff_start_key = parent["diff_start_key"] if "diff_start_key" in parent.keys() else None
+            diff_end_key = parent["diff_end_key"] if "diff_end_key" in parent.keys() else None
             parent_selection_raw = parent["selection_json"] if "selection_json" in parent.keys() else None
             if selection is None and parent_selection_raw:
                 try:
@@ -1322,6 +1339,9 @@ def create_comment(
             body,
             reviewer,
             parent_id,
+            kind,
+            diff_start_key,
+            diff_end_key,
             now_ts(),
         )
         if DB_BACKEND == "postgres":
@@ -1329,8 +1349,8 @@ def create_comment(
                 """
                 INSERT INTO comments (
                     build_id, page_path, line_start, line_end, selected_text, selection_json, body, reviewer,
-                    parent_id, resolved, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                    parent_id, kind, diff_start_key, diff_end_key, resolved, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
                 RETURNING id
                 """,
                 values,
@@ -1343,8 +1363,8 @@ def create_comment(
                 """
                 INSERT INTO comments (
                     build_id, page_path, line_start, line_end, selected_text, selection_json, body, reviewer,
-                    parent_id, resolved, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                    parent_id, kind, diff_start_key, diff_end_key, resolved, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
                 """,
                 values,
             )

@@ -6,6 +6,15 @@
 
   const REVIEWER_KEY = "docs-review-reviewer";
   const PANEL_VISIBLE_KEY = "docs-review-panel-visible";
+  // True when this script is loaded directly on the standalone changed-pages
+  // page (viewed by URL, not embedded in the preview page's modal) — there's
+  // no rendered prose here, and the diff page's own script already owns
+  // selection-to-comment, so this widget only needs to render the list.
+  const DIFF_MODE = ctx.mode === "diff";
+  // ctx.pagePath is temporarily overridden while the diff modal has a
+  // different file open (see __reviewSetActivePage) and restored to this
+  // once the modal closes — the widget is a single instance either way.
+  const basePagePath = ctx.pagePath;
   const CONTENT_ROOT = document.querySelector("main") || document.body;
   const HAS_CUSTOM_HIGHLIGHT_API =
     typeof window.Highlight === "function" &&
@@ -20,15 +29,14 @@
   let panel = null;
   let panelBody = null;
   let panelShowButton = null;
-  let reviewerEntry = null;
-  let reviewerInput = null;
-  let reviewerHelp = null;
-  let pendingReviewerAction = null;
-  let reviewerBadge = null;
   let diffModalOverlay = null;
   let diffModalIframe = null;
+  let lastHandledHash = null;
+  let commentComposer = null;
 
-  assignLineNumbers();
+  if (!DIFF_MODE) {
+    assignLineNumbers();
+  }
   panel = createPanel();
   try {
     if (window.localStorage.getItem(PANEL_VISIBLE_KEY) === "0") {
@@ -37,8 +45,28 @@
   } catch (_) {}
   refreshComments();
 
-  document.addEventListener("mouseup", onSelectionComplete);
-  document.addEventListener("keyup", onSelectionComplete);
+  // The changed-pages diff modal calls this (as window.parent.__reviewSetActivePage)
+  // whenever the user picks a different file in its sidebar — there's no full
+  // reload, so nothing else tells this widget the focused page changed. It's
+  // restored to basePagePath when the modal closes, see closeModal().
+  window.__reviewSetActivePage = function (pagePath) {
+    ctx.pagePath = pagePath;
+    // Don't force-clear activeCommentId here — renderComments() (called via
+    // refreshComments() below) already keeps it active if that comment is in
+    // the newly-fetched list, and clears it otherwise. Clearing unconditionally
+    // here would wipe out the very comment a click just activated, since
+    // opening/refreshing the diff modal always routes back through this.
+    refreshComments();
+  };
+
+  // In DIFF_MODE, the diff page's own inline script already owns
+  // selecting diff text to add a comment (it knows about diff row keys,
+  // which this widget doesn't) — don't also attach a prose-oriented
+  // selection listener that would just misfire over diff table content.
+  if (!DIFF_MODE) {
+    document.addEventListener("mouseup", onSelectionComplete);
+    document.addEventListener("keyup", onSelectionComplete);
+  }
   document.addEventListener("click", onDocumentClick);
   window.addEventListener("scroll", onViewportChanged, true);
   window.addEventListener("resize", onViewportChanged);
@@ -232,7 +260,18 @@
       floatingButton.type = "button";
       floatingButton.textContent = "Add comment";
       floatingButton.className = "review-floating-action";
-      floatingButton.addEventListener("click", addCommentFromSelection);
+      floatingButton.addEventListener("click", function () {
+        if (!pendingSelection) {
+          return;
+        }
+        const selectionData = clonePendingSelection(pendingSelection);
+        const rect = pendingSelection.rect;
+        hideFloatingButton();
+        showCommentComposer(rect, function (reviewer, body) {
+          setReviewerName(reviewer);
+          addCommentForSelection(selectionData, reviewer, body);
+        });
+      });
       document.body.appendChild(floatingButton);
     }
 
@@ -263,6 +302,79 @@
     pendingSelection = null;
   }
 
+  function removeCommentComposer() {
+    if (commentComposer) {
+      commentComposer.remove();
+      commentComposer = null;
+    }
+  }
+
+  function showCommentComposer(rect, onSubmit) {
+    removeCommentComposer();
+    commentComposer = document.createElement("div");
+    commentComposer.className = "review-comment-composer";
+    const margin = 10;
+    const composerWidth = 260;
+    const composerHeight = 160;
+    let left = rect.left;
+    let top = rect.bottom + 8;
+    if (left + composerWidth > window.innerWidth - margin) {
+      left = window.innerWidth - composerWidth - margin;
+    }
+    if (left < margin) {
+      left = margin;
+    }
+    if (top + composerHeight > window.innerHeight - margin) {
+      top = Math.max(margin, rect.top - composerHeight - 8);
+    }
+    commentComposer.style.left = `${Math.round(left)}px`;
+    commentComposer.style.top = `${Math.round(top)}px`;
+    commentComposer.innerHTML = `
+      <input type="text" class="review-composer-reviewer" placeholder="Your name" value="${escapeHtml(getReviewerName())}">
+      <textarea class="review-composer-body" placeholder="Leave a comment" rows="3"></textarea>
+      <div class="review-composer-error" hidden></div>
+      <div class="review-composer-actions">
+        <button type="button" class="review-composer-cancel">Cancel</button>
+        <button type="button" class="review-composer-submit">Comment</button>
+      </div>
+    `;
+    document.body.appendChild(commentComposer);
+    const reviewerInput = commentComposer.querySelector(".review-composer-reviewer");
+    const textarea = commentComposer.querySelector(".review-composer-body");
+    const errorEl = commentComposer.querySelector(".review-composer-error");
+    if (getReviewerName()) {
+      textarea.focus();
+    } else {
+      reviewerInput.focus();
+    }
+    commentComposer.querySelector(".review-composer-cancel").addEventListener("click", function () {
+      removeCommentComposer();
+      const selection = window.getSelection();
+      if (selection) {
+        selection.removeAllRanges();
+      }
+      hideFloatingButton();
+    });
+    commentComposer.querySelector(".review-composer-submit").addEventListener("click", function () {
+      const reviewer = reviewerInput.value.trim();
+      const body = textarea.value.trim();
+      if (!reviewer) {
+        errorEl.textContent = "Enter your name to comment.";
+        errorEl.hidden = false;
+        reviewerInput.focus();
+        return;
+      }
+      if (!body) {
+        errorEl.textContent = "Comment text is required.";
+        errorEl.hidden = false;
+        textarea.focus();
+        return;
+      }
+      removeCommentComposer();
+      onSubmit(reviewer, body);
+    });
+  }
+
   function getReviewerName() {
     return (window.sessionStorage.getItem(REVIEWER_KEY) || "").trim();
   }
@@ -273,113 +385,7 @@
       return "";
     }
     window.sessionStorage.setItem(REVIEWER_KEY, trimmed);
-    if (reviewerInput && reviewerInput.value !== trimmed) {
-      reviewerInput.value = trimmed;
-    }
-    updateReviewerBadge();
-    clearReviewerPrompt();
     return trimmed;
-  }
-
-  function updateReviewerBadge() {
-    if (!reviewerBadge) {
-      return;
-    }
-    const reviewer = getReviewerName();
-    if (reviewer) {
-      reviewerBadge.textContent = `Reviewer: ${reviewer}`;
-      reviewerBadge.classList.remove("is-missing");
-    } else {
-      reviewerBadge.textContent = "Reviewer: not set";
-      reviewerBadge.classList.add("is-missing");
-    }
-
-    if (reviewerEntry) {
-      reviewerEntry.hidden = !!reviewer;
-    }
-    reviewerBadge.hidden = !reviewer;
-    if (!reviewer && reviewerInput) {
-      reviewerInput.value = "";
-    }
-  }
-
-  function clearReviewerPrompt() {
-    if (reviewerHelp) {
-      reviewerHelp.textContent = "";
-    }
-    if (reviewerInput) {
-      reviewerInput.classList.remove("is-required");
-    }
-  }
-
-  function requestReviewerName(afterSetAction) {
-    setPanelVisible(true);
-    if (typeof afterSetAction === "function") {
-      pendingReviewerAction = afterSetAction;
-    }
-    if (reviewerHelp) {
-      reviewerHelp.textContent = "Set your reviewer name to continue.";
-    }
-    if (reviewerInput) {
-      reviewerInput.classList.add("is-required");
-      reviewerInput.focus();
-      reviewerInput.select();
-    }
-  }
-
-  function beginReviewerEdit() {
-    const current = getReviewerName();
-    if (reviewerEntry) {
-      reviewerEntry.hidden = false;
-    }
-    if (reviewerBadge) {
-      reviewerBadge.hidden = true;
-    }
-    if (reviewerInput) {
-      reviewerInput.value = current;
-      reviewerInput.focus();
-      reviewerInput.select();
-    }
-    clearReviewerPrompt();
-  }
-
-  function saveReviewerFromInput() {
-    if (!reviewerInput) {
-      return "";
-    }
-    const saved = setReviewerName(reviewerInput.value);
-    if (!saved) {
-      if (reviewerHelp) {
-        reviewerHelp.textContent = "Reviewer name is required.";
-      }
-      reviewerInput.classList.add("is-required");
-      reviewerInput.focus();
-      return "";
-    }
-    const action = pendingReviewerAction;
-    pendingReviewerAction = null;
-    if (typeof action === "function") {
-      window.setTimeout(function () {
-        try {
-          const maybePromise = action();
-          if (maybePromise && typeof maybePromise.catch === "function") {
-            maybePromise.catch((err) => console.error(err));
-          }
-        } catch (err) {
-          console.error(err);
-        }
-      }, 0);
-    }
-    return saved;
-  }
-
-  function ensureReviewerName(promptIfMissing, onReadyAction) {
-    const existing = getReviewerName();
-    if (existing || !promptIfMissing) {
-      return existing;
-    }
-    requestReviewerName(onReadyAction);
-    return "";
   }
 
   function onDocumentClick(event) {
@@ -431,12 +437,6 @@
                 <path d="M21 12a8.5 8.5 0 0 1-8.5 8.5H6l-3 3v-6.5A8.5 8.5 0 1 1 21 12z"></path>
               </svg>
             </button>
-            <button type="button" class="review-icon-button" id="review-change-reviewer" title="Change reviewer name" aria-label="Change reviewer name">
-              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                <path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8z"></path>
-                <path d="M5 20a7 7 0 0 1 14 0"></path>
-              </svg>
-            </button>
             <button type="button" class="review-icon-button" id="review-toggle-resolved" title="Show resolved comments" aria-label="Show resolved comments">
               <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                 <path d="M4 7h10"></path>
@@ -446,17 +446,6 @@
               </svg>
             </button>
           </div>
-        </div>
-        <div class="review-reviewer-row">
-          <div class="review-reviewer-entry" id="review-reviewer-entry">
-            <label for="review-reviewer-input">Reviewer name</label>
-            <div class="review-reviewer-controls">
-              <input type="text" id="review-reviewer-input" autocomplete="name" maxlength="120" placeholder="Enter your name" />
-              <button type="button" id="review-reviewer-save">Set name</button>
-            </div>
-            <div class="review-reviewer-help" id="review-reviewer-help" aria-live="polite"></div>
-          </div>
-          <span class="review-current-reviewer" id="review-current-reviewer">Reviewer: not set</span>
         </div>
         <div class="review-comment-hint">Highlight text on the page to add comments.</div>
         <div id="review-panel-body">Loading...</div>
@@ -473,30 +462,6 @@
     }
 
     panelBody = aside.querySelector("#review-panel-body");
-    reviewerEntry = aside.querySelector("#review-reviewer-entry");
-    reviewerBadge = aside.querySelector("#review-current-reviewer");
-    reviewerInput = aside.querySelector("#review-reviewer-input");
-    reviewerHelp = aside.querySelector("#review-reviewer-help");
-    const reviewerSaveButton = aside.querySelector("#review-reviewer-save");
-    if (reviewerInput) {
-      reviewerInput.value = getReviewerName();
-      reviewerInput.addEventListener("input", clearReviewerPrompt);
-      reviewerInput.addEventListener("keydown", function (event) {
-        if (event.key === "Enter") {
-          event.preventDefault();
-          saveReviewerFromInput();
-        }
-      });
-    }
-    if (reviewerSaveButton) {
-      reviewerSaveButton.addEventListener("click", saveReviewerFromInput);
-    }
-    updateReviewerBadge();
-
-    const changeReviewerButton = aside.querySelector("#review-change-reviewer");
-    if (changeReviewerButton) {
-      changeReviewerButton.addEventListener("click", beginReviewerEdit);
-    }
 
     const toggleButton = aside.querySelector("#review-toggle-resolved");
     updateResolvedToggleLabel(toggleButton);
@@ -510,7 +475,7 @@
 
     var diffBtn = aside.querySelector("#review-diff-btn");
     if (diffBtn) {
-      diffBtn.addEventListener("click", openDiffModal);
+      diffBtn.addEventListener("click", function () { openDiffModal(); });
     }
 
     var viewAllCommentsBtn = aside.querySelector("#review-view-all-comments");
@@ -567,6 +532,30 @@
     if (diffModalIframe) {
       diffModalIframe.src = "about:blank";
     }
+    // The diff modal may have pointed the widget at whichever file the user
+    // was browsing in its sidebar — go back to showing comments for the page
+    // actually being previewed now that it's closed. No-op for the comments
+    // modal, which never touches ctx.pagePath. (renderComments(), called via
+    // refreshComments(), decides on its own whether activeCommentId survives —
+    // see the comment in __reviewSetActivePage.)
+    if (ctx.pagePath !== basePagePath) {
+      ctx.pagePath = basePagePath;
+      refreshComments();
+    }
+  }
+
+  function pushHighlightsToDiffModal() {
+    if (!diffModalOverlay || diffModalOverlay.hidden || !diffModalIframe) {
+      return;
+    }
+    try {
+      var win = diffModalIframe.contentWindow;
+      if (win && typeof win.__applyCommentHighlights === "function") {
+        win.__applyCommentHighlights(commentsCache);
+      }
+    } catch (_) {
+      // Cross-frame access can throw if the iframe hasn't finished loading yet.
+    }
   }
 
   // Exposed so the same-origin iframes we open (changed-pages, comments) can
@@ -576,9 +565,12 @@
   // happening.
   window.__reviewCloseModal = closeModal;
 
-  function openDiffModal() {
+  function openDiffModal(highlightCommentId) {
     var url = "/previews/" + encodeURIComponent(String(ctx.buildId)) + "/changed-pages?embed=1&select="
       + encodeURIComponent(ctx.pagePath);
+    if (highlightCommentId) {
+      url += "&highlight=" + encodeURIComponent(String(highlightCommentId));
+    }
     openModal("Changed pages", url);
   }
 
@@ -626,29 +618,19 @@
     };
   }
 
-  async function addCommentForSelection(selectionData) {
-    if (!selectionData) {
-      return;
-    }
-    const reviewer = ensureReviewerName(true, function () {
-      return addCommentForSelection(selectionData);
-    });
-    if (!reviewer) {
-      return;
-    }
-    const body = window.prompt("Add comment");
-    if (!body || !body.trim()) {
+  async function addCommentForSelection(selectionData, reviewer, body) {
+    if (!selectionData || !reviewer || !body) {
       return;
     }
     const payload = {
       build_id: ctx.buildId,
       page_path: ctx.pagePath,
+      selected_text: selectionData.selectedText,
+      body: body,
+      reviewer: reviewer,
       line_start: selectionData.lineStart,
       line_end: selectionData.lineEnd,
-      selected_text: selectionData.selectedText,
       selection: selectionData.selection,
-      body: body.trim(),
-      reviewer: reviewer,
     };
     try {
       await api("/api/comments", payload);
@@ -656,20 +638,11 @@
       if (selection) {
         selection.removeAllRanges();
       }
-      hideFloatingButton();
       await refreshComments();
     } catch (err) {
       console.error(err);
       window.alert("Could not create comment.");
     }
-  }
-
-  async function addCommentFromSelection() {
-    if (!pendingSelection) {
-      return;
-    }
-    const selectionData = clonePendingSelection(pendingSelection);
-    await addCommentForSelection(selectionData);
   }
 
   async function refreshComments() {
@@ -682,6 +655,7 @@
       const data = await response.json();
       commentsCache = Array.isArray(data.comments) ? data.comments : [];
       renderComments(commentsCache);
+      pushHighlightsToDiffModal();
     } catch (err) {
       console.error(err);
       renderError("Failed to load comments.");
@@ -737,6 +711,7 @@
     header.className = "review-comment-head";
     header.innerHTML = `
       <strong>${escapeHtml(String(comment.reviewer || "reviewer"))}</strong>
+      ${comment.kind === "diff" ? '<span class="review-comment-kind-badge">diff</span>' : ""}
       <span>${comment.resolved ? "resolved" : "open"}</span>
     `;
     card.appendChild(header);
@@ -765,9 +740,9 @@
     const replyButton = document.createElement("button");
     replyButton.type = "button";
     replyButton.textContent = "Reply";
-    replyButton.addEventListener("click", async function (event) {
+    replyButton.addEventListener("click", function (event) {
       event.stopPropagation();
-      await replyTo(comment.id);
+      replyTo(comment.id, replyButton.getBoundingClientRect());
     });
     actions.appendChild(replyButton);
 
@@ -787,10 +762,70 @@
     }
 
     card.addEventListener("click", function () {
-      setActiveComment(comment, true);
+      if (DIFF_MODE) {
+        // We ARE the diff page here (standalone view, no modal involved) —
+        // reveal directly via the diff-rendering script's own hook.
+        setActiveComment(comment, false);
+        if (comment.kind === "diff" && window.__revealAndScrollToDiffKey) {
+          window.__revealAndScrollToDiffKey(comment.diff_start_key) ||
+            window.__revealAndScrollToDiffKey(comment.diff_end_key);
+        } else if (comment.kind !== "diff") {
+          openPreviewForComment(comment);
+        }
+        return;
+      }
+      // Whenever the diff modal is open, any comment currently listed here
+      // belongs to whichever page it's showing (ctx.pagePath tracks that) —
+      // comparing to basePagePath would wrongly say "not showing this page"
+      // for the common case of opening the modal on the page you're on.
+      const modalOpen = diffModalOverlay && !diffModalOverlay.hidden;
+      if (comment.kind === "diff") {
+        // No comment.selection/line_start to scroll to in the rendered page for
+        // a diff comment, so setActiveComment just applies the "active" blue
+        // outline here — the actual reveal happens in the diff table below.
+        setActiveComment(comment, false);
+        if (modalOpen) {
+          revealInDiffModal(comment);
+        } else {
+          openDiffModal(comment.id);
+        }
+      } else if (ctx.pagePath !== basePagePath) {
+        openPreviewForComment(comment);
+      } else {
+        // The modal (if open) covers the whole screen, so a preview comment's
+        // scroll-and-highlight in the page underneath would otherwise happen
+        // out of view.
+        closeModal();
+        setActiveComment(comment, true);
+      }
     });
 
     return card;
+  }
+
+  function buildUrlFor(pagePath) {
+    return "/" + ctx.buildTag + pagePath;
+  }
+
+  function openPreviewForComment(comment) {
+    closeModal();
+    window.location.href = buildUrlFor(String(comment.page_path)) + "#review-comment-" + comment.id;
+  }
+
+  // The diff table lives inside the modal's iframe, not this document, so
+  // revealing a row means reaching into it — its own script exposes this,
+  // see __revealAndScrollToDiffKey in the changed-pages page.
+  function revealInDiffModal(comment) {
+    if (!diffModalIframe) {
+      return;
+    }
+    try {
+      var win = diffModalIframe.contentWindow;
+      if (win && typeof win.__revealAndScrollToDiffKey === "function") {
+        win.__revealAndScrollToDiffKey(comment.diff_start_key) ||
+          win.__revealAndScrollToDiffKey(comment.diff_end_key);
+      }
+    } catch (_) {}
   }
 
   function clearHighlights() {
@@ -894,21 +929,18 @@
     }
   }
 
-  async function replyTo(commentId) {
-    const reviewer = ensureReviewerName(true, function () {
-      return replyTo(commentId);
+  function replyTo(commentId, rect) {
+    showCommentComposer(rect, function (reviewer, body) {
+      setReviewerName(reviewer);
+      postReply(commentId, reviewer, body);
     });
-    if (!reviewer) {
-      return;
-    }
-    const body = window.prompt(`Add reply\nPosting as "${reviewer}".`);
-    if (!body || !body.trim()) {
-      return;
-    }
+  }
+
+  async function postReply(commentId, reviewer, body) {
     try {
       await api(`/api/comments/${commentId}/reply`, {
         reviewer: reviewer,
-        body: body.trim(),
+        body: body,
       });
       await refreshComments();
     } catch (err) {
@@ -933,8 +965,32 @@
   }
 
   function jumpToCommentIfRequested(comments) {
+    // Handle a given hash at most once per renderComments() call cycle — it
+    // re-runs after unrelated actions (toggling "show resolved", posting a
+    // reply, a diff modal reporting its active page, ...), and without this
+    // guard the one-time "jump to this comment" action would instead fire on
+    // every re-render, permanently overriding whatever comment was actually
+    // last clicked with whichever one the URL hash happens to name.
+    const alreadyHandled = window.location.hash === lastHandledHash;
+
+    const diffMatch = window.location.hash.match(/^#review-diff-comment-(\d+)$/);
+    if (diffMatch) {
+      if (alreadyHandled) {
+        return false;
+      }
+      const diffCommentId = Number(diffMatch[1]);
+      const diffComment = comments.find((item) => Number(item.id) === diffCommentId);
+      if (!diffComment) {
+        return false;
+      }
+      lastHandledHash = window.location.hash;
+      setPanelVisible(true);
+      openDiffModal(diffCommentId);
+      return true;
+    }
+
     const match = window.location.hash.match(/^#review-comment-(\d+)$/);
-    if (!match) {
+    if (!match || alreadyHandled) {
       return false;
     }
     const commentId = Number(match[1]);
@@ -942,6 +998,7 @@
     if (!comment) {
       return false;
     }
+    lastHandledHash = window.location.hash;
     setPanelVisible(true);
     setActiveComment(comment, true);
     const card = document.getElementById(`review-comment-${commentId}`);
