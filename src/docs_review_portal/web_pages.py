@@ -171,62 +171,19 @@ class ReviewPagesMixin:
             <h2 id="upload-dialog-title">Upload preview</h2>
             <button type="button" class="dialog-close" id="close-upload-dialog" aria-label="Close">&times;</button>
           </div>
-          <div class="tab-bar" role="tablist">
-            <button type="button" class="tab-btn active" role="tab" aria-selected="true" aria-controls="tab-upload" data-tab="upload">Upload</button>
-            <button type="button" class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-cli" data-tab="cli">Command line</button>
-          </div>
-          <div id="tab-upload" class="tab-panel" role="tabpanel">
-            <ol class="upload-steps">
-              <li>
-                <strong>Prepare archive</strong>
-                <p class="subtle" style="margin:6px 0 4px">Docker docs site &mdash; run from the repo root:</p>
-                <pre class="code-hint">docker buildx bake release --set "release.output=type=local,dest=/tmp/preview-site" &amp;&amp; \
-git diff origin/main...HEAD --name-only --diff-filter=ACM -- content/ | sed 's|^content||;s|/_index\.md$|/|;s|/index\.md$|/|;s|\.md$|/|;s|^/manuals/|/|' | sort -u &gt; /tmp/preview-site/.changed-pages &amp;&amp; \
-tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/preview-site</pre>
-                <p class="subtle" style="margin:8px 0 4px">Other static sites (output in <code>dist/</code>):</p>
-                <pre class="code-hint">tar -C dist -czf /tmp/my-preview.tar.gz .</pre>
-              </li>
-              <li>
-                <strong>Upload</strong>
-                <form id="upload-form" class="grid-form" style="margin-top:10px">
-                  <label>
-                    Preview name
-                    <input type="text" name="name" required placeholder="my-feature-branch">
-                  </label>
-                  <label>
-                    Archive (.tar.gz)
-                    <input type="file" name="archive" accept=".tar.gz,.tgz" required>
-                  </label>
-                  <label>
-                    Rewrite host <span class="subtle">(optional)</span>
-                    <input type="text" name="rewrite_host" placeholder="docs.docker.com">
-                  </label>
-                  <div style="align-self:end">
-                    <button type="submit">Upload</button>
-                  </div>
-                </form>
-                <div id="upload-progress" hidden>
-                  <div class="upload-bar-track"><div class="upload-bar" id="upload-bar"></div></div>
-                  <p id="upload-status" class="subtle" style="margin:4px 0 0"></p>
-                </div>
-              </li>
-            </ol>
-          </div>
-          <div id="tab-cli" class="tab-panel" role="tabpanel" hidden>
-            <p class="subtle" style="margin:16px 0 4px"><strong>Publish script</strong> &mdash; Docker docs site only. Builds, archives, and uploads in one step:</p>
-            <pre class="code-hint">curl -fsSL https://raw.githubusercontent.com/craig-osterhout/docs-review-portal/refs/heads/main/scripts/publish-branch.sh | sh -s -- my-preview --docs-path ~/path/to/docs</pre>
-            <hr class="dialog-rule">
-            <p class="subtle" style="margin:14px 0 4px"><strong>API</strong> &mdash; any static site. Package your built output, then upload:</p>
-            <p class="subtle" style="margin:10px 0 4px">1. Package:</p>
-            <pre class="code-hint">tar -C dist -czf /tmp/my-preview.tar.gz .</pre>
-            <p class="subtle" style="margin:12px 0 4px">2. Upload:</p>
-            <pre class="code-hint">curl -X POST "{html.escape(self._public_base())}/api/builds/upload?name=my-preview" \
-  -H "Content-Type: application/gzip" \
-  --data-binary "@/tmp/my-preview.tar.gz"</pre>
-            <p class="subtle" style="margin:10px 0 0">For archives larger than ~30 MiB, use the <strong>Upload tab</strong> instead &mdash; it handles chunking automatically.</p>
-          </div>
+          <p class="subtle" style="margin:0 0 4px">This script will build, package and upload the docs site for you. Replace <code>&lt;name&gt;</code> with the name of the preview (the branch name works well) and replace <code>/path/to/local/docs</code> with the path to your local docs repo:</p>
+          <pre class="code-hint">REVIEW_SERVICE_URL={html.escape(self._public_base())} \\
+  bash &lt;(curl -fsSL https://raw.githubusercontent.com/craig-osterhout/docs-review-portal/refs/heads/main/scripts/publish-branch.sh) &lt;name&gt; \\
+  --docs-path /path/to/local/docs</pre>
         </dialog>
-        <script src="/_review/assets/upload.js"></script>
+        <script>
+          (function () {{
+            var dialog = document.getElementById('upload-dialog');
+            document.getElementById('open-upload-dialog').addEventListener('click', function () {{ dialog.showModal(); }});
+            document.getElementById('close-upload-dialog').addEventListener('click', function () {{ dialog.close(); }});
+            dialog.addEventListener('click', function (e) {{ if (e.target === dialog) dialog.close(); }});
+          }})();
+        </script>
         <section class="panel">
           <table>
             <thead>

@@ -104,14 +104,17 @@ Open:
 - `http://localhost:8080/logs`
 - `http://localhost:8080/healthz`
 
-## Upload a preview (browser)
+## Upload a preview
 
-Open `/previews` and click **Upload preview**. The dialog has two tabs:
+The **Upload preview** button on the `/previews` page shows the publish script command to copy. It builds, packages and uploads the docs site for you:
 
-- **Upload** — select a pre-built `.tar.gz` archive and fill in a preview name. One-liner commands for the Docker docs site and generic static sites are shown as a reference.
-- **Command line** — the `publish-branch.sh` script and raw `curl` API examples.
+```bash
+REVIEW_SERVICE_URL=https://<service-url> \
+  bash <(curl -fsSL https://raw.githubusercontent.com/craig-osterhout/docs-review-portal/refs/heads/main/scripts/publish-branch.sh) <name> \
+  --docs-path /path/to/local/docs
+```
 
-The browser upload handles chunking automatically for large archives.
+The script handles chunking automatically for large archives. To upload an archive for any other static site, use the API below.
 
 ## Changed pages
 
