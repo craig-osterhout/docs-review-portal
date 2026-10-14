@@ -1078,8 +1078,83 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
             if (floatingAddBtn) {{ floatingAddBtn.remove(); floatingAddBtn = null; }}
           }}
 
+          var composerCleanup = null;
+          var COMPOSER_SIZE_KEY = 'docs-review-composer-size';
+
           function removeDiffComposer() {{
             if (diffComposer) {{ diffComposer.remove(); diffComposer = null; }}
+            if (composerCleanup) {{ composerCleanup(); composerCleanup = null; }}
+          }}
+
+          function loadComposerSize() {{
+            try {{
+              var saved = JSON.parse(window.localStorage.getItem(COMPOSER_SIZE_KEY) || 'null');
+              if (saved && isFinite(saved.width) && isFinite(saved.height)) {{ return saved; }}
+            }} catch (e) {{}}
+            return null;
+          }}
+
+          function saveComposerSize(width, height) {{
+            try {{
+              window.localStorage.setItem(COMPOSER_SIZE_KEY, JSON.stringify({{
+                width: Math.round(width),
+                height: Math.round(height),
+              }}));
+            }} catch (e) {{}}
+          }}
+
+          // Keeps the composer fully on screen. The position is pulled back first and
+          // the max size is then limited to the room left, so a composer the user made
+          // large shrinks when the window gets smaller and grows back when it gets larger.
+          function fitComposerToViewport(el) {{
+            var margin = 10;
+            var left = Math.max(margin, Math.min(parseFloat(el.style.left) || 0, window.innerWidth - el.offsetWidth - margin));
+            var top = Math.max(margin, Math.min(parseFloat(el.style.top) || 0, window.innerHeight - el.offsetHeight - margin));
+            el.style.left = Math.round(left) + 'px';
+            el.style.top = Math.round(top) + 'px';
+            el.style.maxWidth = Math.max(0, window.innerWidth - left - margin) + 'px';
+            el.style.maxHeight = Math.max(0, window.innerHeight - top - margin) + 'px';
+          }}
+
+          // Applies the size saved from an earlier resize and saves new sizes, but only
+          // while the user is dragging the resize handle. Shrinks forced by the viewport
+          // are never saved, so the preferred size survives a temporarily small window.
+          function setupComposerResize(el, rect) {{
+            var margin = 10;
+            var saved = loadComposerSize();
+            if (saved) {{
+              el.style.width = Math.min(saved.width, window.innerWidth - 2 * margin) + 'px';
+              el.style.height = Math.min(saved.height, window.innerHeight - 2 * margin) + 'px';
+            }}
+            document.body.appendChild(el);
+            var top = rect.bottom + 8;
+            if (top + el.offsetHeight > window.innerHeight - margin) {{
+              top = Math.max(margin, rect.top - el.offsetHeight - 8);
+            }}
+            el.style.left = Math.round(rect.left) + 'px';
+            el.style.top = Math.round(top) + 'px';
+            fitComposerToViewport(el);
+
+            var dragging = false;
+            function onPointerDown() {{ dragging = true; }}
+            function onPointerUp() {{ dragging = false; }}
+            function onWindowResize() {{ fitComposerToViewport(el); }}
+            var observer = new ResizeObserver(function() {{
+              if (dragging) {{ saveComposerSize(el.offsetWidth, el.offsetHeight); }}
+            }});
+            el.addEventListener('pointerdown', onPointerDown);
+            window.addEventListener('pointerup', onPointerUp);
+            window.addEventListener('pointercancel', onPointerUp);
+            window.addEventListener('mouseup', onPointerUp);
+            window.addEventListener('resize', onWindowResize);
+            observer.observe(el);
+            composerCleanup = function() {{
+              observer.disconnect();
+              window.removeEventListener('pointerup', onPointerUp);
+              window.removeEventListener('pointercancel', onPointerUp);
+              window.removeEventListener('mouseup', onPointerUp);
+              window.removeEventListener('resize', onWindowResize);
+            }};
           }}
 
           function wireDiffSelection(table, pagePath) {{
@@ -1132,8 +1207,6 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
             removeDiffComposer();
             diffComposer = document.createElement('div');
             diffComposer.className = 'diff-add-comment-composer';
-            diffComposer.style.top = Math.max(8, rect.bottom + 8) + 'px';
-            diffComposer.style.left = Math.max(8, rect.left) + 'px';
             diffComposer.innerHTML =
               '<input type="text" class="diff-composer-reviewer" placeholder="Your name" value="' + escHtml(getReviewerName()) + '">' +
               '<textarea class="diff-composer-body" placeholder="Leave a comment" rows="3"></textarea>' +
@@ -1142,7 +1215,7 @@ tar -C /tmp/preview-site -czf /tmp/my-preview.tar.gz . &amp;&amp; rm -rf /tmp/pr
                 '<button type="button" class="diff-composer-cancel">Cancel</button>' +
                 '<button type="button" class="diff-composer-submit">Comment</button>' +
               '</div>';
-            document.body.appendChild(diffComposer);
+            setupComposerResize(diffComposer, rect);
             var reviewerInput = diffComposer.querySelector('.diff-composer-reviewer');
             var textarea = diffComposer.querySelector('.diff-composer-body');
             var errorEl = diffComposer.querySelector('.diff-composer-error');

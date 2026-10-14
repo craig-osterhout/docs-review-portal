@@ -6,6 +6,7 @@
 
   const REVIEWER_KEY = "docs-review-reviewer";
   const PANEL_VISIBLE_KEY = "docs-review-panel-visible";
+  const COMPOSER_SIZE_KEY = "docs-review-composer-size";
   // True when this script is loaded directly on the standalone changed-pages
   // page (viewed by URL, not embedded in the preview page's modal) — there's
   // no rendered prose here, and the diff page's own script already owns
@@ -33,6 +34,7 @@
   let diffModalIframe = null;
   let lastHandledHash = null;
   let commentComposer = null;
+  let composerCleanup = null;
 
   if (!DIFF_MODE) {
     assignLineNumbers();
@@ -307,28 +309,104 @@
       commentComposer.remove();
       commentComposer = null;
     }
+    if (composerCleanup) {
+      composerCleanup();
+      composerCleanup = null;
+    }
+  }
+
+  function loadComposerSize() {
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(COMPOSER_SIZE_KEY) || "null");
+      if (saved && Number.isFinite(saved.width) && Number.isFinite(saved.height)) {
+        return saved;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function saveComposerSize(width, height) {
+    try {
+      window.localStorage.setItem(
+        COMPOSER_SIZE_KEY,
+        JSON.stringify({ width: Math.round(width), height: Math.round(height) })
+      );
+    } catch (_) {}
+  }
+
+  // Keeps the composer fully on screen. The position is pulled back first and
+  // the max size is then limited to the room left, so a composer the user made
+  // large shrinks when the window gets smaller and grows back when it gets larger.
+  function fitComposerToViewport(el) {
+    const margin = 10;
+    const left = Math.max(
+      margin,
+      Math.min(parseFloat(el.style.left) || 0, window.innerWidth - el.offsetWidth - margin)
+    );
+    const top = Math.max(
+      margin,
+      Math.min(parseFloat(el.style.top) || 0, window.innerHeight - el.offsetHeight - margin)
+    );
+    el.style.left = `${Math.round(left)}px`;
+    el.style.top = `${Math.round(top)}px`;
+    el.style.maxWidth = `${Math.max(0, window.innerWidth - left - margin)}px`;
+    el.style.maxHeight = `${Math.max(0, window.innerHeight - top - margin)}px`;
+  }
+
+  // Applies the size saved from an earlier resize and saves new sizes, but only
+  // while the user is dragging the resize handle. Shrinks forced by the viewport
+  // are never saved, so the preferred size survives a temporarily small window.
+  function setupComposerResize(el, rect) {
+    const margin = 10;
+    const saved = loadComposerSize();
+    if (saved) {
+      el.style.width = `${Math.min(saved.width, window.innerWidth - 2 * margin)}px`;
+      el.style.height = `${Math.min(saved.height, window.innerHeight - 2 * margin)}px`;
+    }
+    document.body.appendChild(el);
+    const left = rect.left;
+    let top = rect.bottom + 8;
+    if (top + el.offsetHeight > window.innerHeight - margin) {
+      top = Math.max(margin, rect.top - el.offsetHeight - 8);
+    }
+    el.style.left = `${Math.round(left)}px`;
+    el.style.top = `${Math.round(top)}px`;
+    fitComposerToViewport(el);
+
+    let dragging = false;
+    const onPointerDown = function () {
+      dragging = true;
+    };
+    const onPointerUp = function () {
+      dragging = false;
+    };
+    const onWindowResize = function () {
+      fitComposerToViewport(el);
+    };
+    const observer = new ResizeObserver(function () {
+      if (dragging) {
+        saveComposerSize(el.offsetWidth, el.offsetHeight);
+      }
+    });
+    el.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerUp);
+    window.addEventListener("mouseup", onPointerUp);
+    window.addEventListener("resize", onWindowResize);
+    observer.observe(el);
+    composerCleanup = function () {
+      observer.disconnect();
+      window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("pointercancel", onPointerUp);
+      window.removeEventListener("mouseup", onPointerUp);
+      window.removeEventListener("resize", onWindowResize);
+    };
   }
 
   function showCommentComposer(rect, onSubmit) {
     removeCommentComposer();
     commentComposer = document.createElement("div");
     commentComposer.className = "review-comment-composer";
-    const margin = 10;
-    const composerWidth = 260;
-    const composerHeight = 160;
-    let left = rect.left;
-    let top = rect.bottom + 8;
-    if (left + composerWidth > window.innerWidth - margin) {
-      left = window.innerWidth - composerWidth - margin;
-    }
-    if (left < margin) {
-      left = margin;
-    }
-    if (top + composerHeight > window.innerHeight - margin) {
-      top = Math.max(margin, rect.top - composerHeight - 8);
-    }
-    commentComposer.style.left = `${Math.round(left)}px`;
-    commentComposer.style.top = `${Math.round(top)}px`;
     commentComposer.innerHTML = `
       <input type="text" class="review-composer-reviewer" placeholder="Your name" value="${escapeHtml(getReviewerName())}">
       <textarea class="review-composer-body" placeholder="Leave a comment" rows="3"></textarea>
@@ -338,7 +416,7 @@
         <button type="button" class="review-composer-submit">Comment</button>
       </div>
     `;
-    document.body.appendChild(commentComposer);
+    setupComposerResize(commentComposer, rect);
     const reviewerInput = commentComposer.querySelector(".review-composer-reviewer");
     const textarea = commentComposer.querySelector(".review-composer-body");
     const errorEl = commentComposer.querySelector(".review-composer-error");

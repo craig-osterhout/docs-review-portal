@@ -720,7 +720,14 @@ blockquote {
 .diff-add-comment-composer {
   position: fixed;
   z-index: 2000;
+  box-sizing: border-box;
   width: 260px;
+  min-width: 220px;
+  min-height: 150px;
+  max-width: calc(100vw - 20px);
+  max-height: calc(100vh - 20px);
+  resize: both;
+  overflow: auto;
   background: #fff;
   border: 1px solid #d9e2ef;
   border-radius: 8px;
@@ -738,7 +745,9 @@ blockquote {
 }
 
 .diff-composer-body {
-  resize: vertical;
+  flex: 1 1 auto;
+  min-height: 54px;
+  resize: none;
 }
 
 .diff-composer-error {
