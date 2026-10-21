@@ -134,6 +134,12 @@ class ReviewHandler(
         if path.startswith("/api/comments/") and path.endswith("/reply"):
             self._api_reply_comment(path)
             return
+        if path.startswith("/api/comments/") and path.endswith("/edit"):
+            self._api_edit_comment(path)
+            return
+        if path.startswith("/api/comments/") and path.endswith("/delete"):
+            self._api_delete_comment(path)
+            return
         if re.match(r"^/api/builds/\d+/changed-pages$", path):
             self._api_update_changed_pages(path)
             return

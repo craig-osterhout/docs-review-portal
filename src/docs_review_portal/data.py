@@ -562,6 +562,8 @@ def init_storage() -> None:
                 conn.execute("ALTER TABLE comments ADD COLUMN diff_start_key TEXT")
             if "diff_end_key" not in comment_columns:
                 conn.execute("ALTER TABLE comments ADD COLUMN diff_end_key TEXT")
+            if "edited_at" not in comment_columns:
+                conn.execute("ALTER TABLE comments ADD COLUMN edited_at INTEGER")
         else:
             conn.executescript(
                 """
@@ -605,6 +607,7 @@ def init_storage() -> None:
                 ALTER TABLE comments ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'preview';
                 ALTER TABLE comments ADD COLUMN IF NOT EXISTS diff_start_key TEXT;
                 ALTER TABLE comments ADD COLUMN IF NOT EXISTS diff_end_key TEXT;
+                ALTER TABLE comments ADD COLUMN IF NOT EXISTS edited_at BIGINT;
 
                 CREATE TABLE IF NOT EXISTS page_diffs (
                     id BIGSERIAL PRIMARY KEY,
@@ -1135,6 +1138,7 @@ def row_to_comment_dict(row: sqlite3.Row) -> dict[str, Any]:
     item.pop("selection_json", None)
     item["created_at_human"] = format_ts(item.get("created_at"))
     item["resolved_at_human"] = format_ts(item.get("resolved_at"))
+    item["edited_at_human"] = format_ts(item.get("edited_at")) if item.get("edited_at") else ""
     return item
 
 
@@ -1400,3 +1404,41 @@ def set_comment_resolved(comment_id: int, resolved: bool) -> None:
         conn.commit()
 
 
+def _writable_comment_row(conn: DBConnectionProxy, comment_id: int) -> Any:
+    row = conn.execute(
+        """
+        SELECT c.id, b.archived_at
+        FROM comments c
+        JOIN builds b ON b.id = c.build_id
+        WHERE c.id = ?
+        """,
+        (comment_id,),
+    ).fetchone()
+    if not row:
+        raise ValueError("comment not found")
+    archived_at = row["archived_at"] if "archived_at" in row.keys() else None
+    if archived_at is not None:
+        raise ValueError("preview is scheduled for deletion and is read-only")
+    return row
+
+
+def update_comment_body(comment_id: int, body: str) -> None:
+    body = body.strip()
+    if not body:
+        raise ValueError("body is required")
+    with db_connect() as conn:
+        _writable_comment_row(conn, comment_id)
+        conn.execute(
+            "UPDATE comments SET body = ?, edited_at = ? WHERE id = ?",
+            (body, now_ts(), comment_id),
+        )
+        conn.commit()
+
+
+def delete_comment(comment_id: int) -> None:
+    """Delete a comment. Deleting a top-level comment also deletes its replies."""
+    with db_connect() as conn:
+        _writable_comment_row(conn, comment_id)
+        conn.execute("DELETE FROM comments WHERE parent_id = ?", (comment_id,))
+        conn.execute("DELETE FROM comments WHERE id = ?", (comment_id,))
+        conn.commit()

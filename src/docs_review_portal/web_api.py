@@ -59,6 +59,7 @@ from docs_review_portal.config import (
 )
 from docs_review_portal.data import (
     create_comment,
+    delete_comment,
     fetch_page_comments,
     fetch_page_diff,
     get_build_by_id,
@@ -68,6 +69,7 @@ from docs_review_portal.data import (
     normalize_selection_payload,
     set_comment_resolved,
     update_build_changed_pages,
+    update_comment_body,
 )
 from docs_review_portal.helpers import (
     build_url,
@@ -366,6 +368,35 @@ class ReviewApiMixin:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
         self._send_json(HTTPStatus.CREATED, {"comment_id": comment_id})
+
+    def _api_edit_comment(self, path: str) -> None:
+        match = re.match(r"^/api/comments/(\d+)/edit$", path)
+        if not match:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Comment not found"})
+            return
+        payload = self._read_json()
+        body = str(payload.get("body", "")).strip()
+        if not body:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "body is required"})
+            return
+        try:
+            update_comment_body(int(match.group(1)), body)
+        except ValueError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        self._send_json(HTTPStatus.OK, {"status": "ok"})
+
+    def _api_delete_comment(self, path: str) -> None:
+        match = re.match(r"^/api/comments/(\d+)/delete$", path)
+        if not match:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Comment not found"})
+            return
+        try:
+            delete_comment(int(match.group(1)))
+        except ValueError as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        self._send_json(HTTPStatus.OK, {"status": "ok"})
 
     def _api_update_changed_pages(self, path: str) -> None:
         match = re.match(r"^/api/builds/(\d+)/changed-pages$", path)

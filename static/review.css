@@ -266,6 +266,93 @@
   font-size: 12px;
 }
 
+.review-actions button.review-action-secondary {
+  background: #ffffff;
+  color: #245cb7;
+}
+
+.review-actions button.review-action-secondary:hover {
+  background: #eef4ff;
+}
+
+.review-actions button.review-action-danger {
+  background: #ffffff;
+  border-color: #c23b3b;
+  color: #a12626;
+}
+
+.review-actions button.review-action-danger:hover {
+  background: #fdeaea;
+}
+
+.review-edit {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.review-reply-reviewer {
+  width: 100%;
+  box-sizing: border-box;
+  font-size: 13px;
+  font-family: inherit;
+}
+
+.review-edit-body {
+  width: 100%;
+  box-sizing: border-box;
+  font-size: 13px;
+  font-family: inherit;
+  resize: vertical;
+}
+
+.review-edit-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.review-edit-actions button {
+  border: 1px solid #245cb7;
+  border-radius: 6px;
+  background: #245cb7;
+  color: #ffffff;
+  padding: 4px 10px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.review-edit-actions button.review-edit-cancel {
+  background: #ffffff;
+  color: #245cb7;
+}
+
+.review-reply-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.review-reply-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.review-reply-actions button {
+  border: none;
+  background: none;
+  padding: 0;
+  font-size: 12px;
+  color: #245cb7;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.review-reply-actions button.review-reply-delete {
+  color: #a12626;
+}
+
 .review-reply {
   border-left: 2px solid #d6deea;
   margin-top: 8px;
@@ -349,4 +436,11 @@
     min-height: 92px;
     padding: 8px 6px;
   }
+}
+
+.review-comment a.review-link,
+.review-reply a.review-link {
+  color: #0054d1;
+  text-decoration: underline;
+  overflow-wrap: anywhere;
 }

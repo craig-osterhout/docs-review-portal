@@ -217,3 +217,26 @@ def html_page(title: str, body: str, auto_refresh: int | None = None, embed: boo
 </html>
 """
 
+
+_URL_PATTERN = re.compile(r"https?://[^\s<>]+", flags=re.IGNORECASE)
+
+
+def linkify_html(text: str) -> str:
+    """Escape text and turn http(s) URLs in it into links that open in a new tab."""
+    parts: list[str] = []
+    last = 0
+    for match in _URL_PATTERN.finditer(text):
+        url = match.group(0)
+        # Leave trailing punctuation (and unbalanced closing brackets) outside the link.
+        while url and (url[-1] in ".,;:!?'\"" or (url[-1] in ")]}" and url.count(url[-1]) > url.count({")": "(", "]": "[", "}": "{"}[url[-1]]))):
+            url = url[:-1]
+        if not re.match(r"https?://[^/\s]", url, flags=re.IGNORECASE):
+            continue
+        parts.append(html.escape(text[last:match.start()]))
+        parts.append(
+            f'<a class="comment-link" href="{html.escape(url, quote=True)}" target="_blank" rel="noopener noreferrer">'
+            f"{html.escape(url)}</a>"
+        )
+        last = match.start() + len(url)
+    parts.append(html.escape(text[last:]))
+    return "".join(parts)

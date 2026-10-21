@@ -796,11 +796,11 @@
 
     const meta = document.createElement("div");
     meta.className = "review-comment-meta";
-    meta.textContent = `${comment.created_at_human || ""}`;
+    meta.textContent = `${comment.created_at_human || ""}${comment.edited_at ? " (edited)" : ""}`;
     card.appendChild(meta);
 
     const text = document.createElement("p");
-    text.textContent = comment.body || "";
+    appendLinkified(text, comment.body || "");
     card.appendChild(text);
 
     const actions = document.createElement("div");
@@ -820,22 +820,41 @@
     replyButton.textContent = "Reply";
     replyButton.addEventListener("click", function (event) {
       event.stopPropagation();
-      replyTo(comment.id, replyButton.getBoundingClientRect());
+      startReplying(comment.id, card, actions);
     });
     actions.appendChild(replyButton);
+
+    const editButton = document.createElement("button");
+    editButton.type = "button";
+    editButton.className = "review-action-secondary";
+    editButton.textContent = "Edit";
+    editButton.addEventListener("click", function (event) {
+      event.stopPropagation();
+      startEditing(comment, text, actions);
+    });
+    actions.appendChild(editButton);
+
+    const deleteButton = document.createElement("button");
+    deleteButton.type = "button";
+    deleteButton.className = "review-action-danger";
+    deleteButton.textContent = "Delete";
+    deleteButton.addEventListener("click", async function (event) {
+      event.stopPropagation();
+      const replyCount = Array.isArray(comment.replies) ? comment.replies.length : 0;
+      const warning = replyCount
+        ? `Delete this comment and its ${replyCount} ${replyCount === 1 ? "reply" : "replies"}?`
+        : "Delete this comment?";
+      if (window.confirm(warning)) {
+        await deleteComment(comment.id);
+      }
+    });
+    actions.appendChild(deleteButton);
 
     card.appendChild(actions);
 
     if (Array.isArray(comment.replies)) {
       comment.replies.forEach((reply) => {
-        const replyEl = document.createElement("div");
-        replyEl.className = "review-reply";
-        replyEl.innerHTML = `
-          <strong>${escapeHtml(String(reply.reviewer || "reviewer"))}</strong>
-          <div class="review-comment-meta">${escapeHtml(String(reply.created_at_human || ""))}</div>
-          <div>${escapeHtml(String(reply.body || ""))}</div>
-        `;
-        card.appendChild(replyEl);
+        card.appendChild(renderReply(reply));
       });
     }
 
@@ -879,6 +898,121 @@
     });
 
     return card;
+  }
+
+  function renderReply(reply) {
+    const replyEl = document.createElement("div");
+    replyEl.className = "review-reply";
+    replyEl.id = `review-comment-${reply.id}`;
+
+    const head = document.createElement("div");
+    head.innerHTML = `
+      <strong>${escapeHtml(String(reply.reviewer || "reviewer"))}</strong>
+      <div class="review-comment-meta">${escapeHtml(String(reply.created_at_human || ""))}${reply.edited_at ? " (edited)" : ""}</div>
+    `;
+    replyEl.appendChild(head);
+
+    const text = document.createElement("div");
+    text.className = "review-reply-text";
+    appendLinkified(text, reply.body || "");
+    replyEl.appendChild(text);
+
+    const actions = document.createElement("div");
+    actions.className = "review-reply-actions";
+
+    const editButton = document.createElement("button");
+    editButton.type = "button";
+    editButton.textContent = "Edit";
+    editButton.addEventListener("click", function (event) {
+      event.stopPropagation();
+      startEditing(reply, text, actions);
+    });
+    actions.appendChild(editButton);
+
+    const deleteButton = document.createElement("button");
+    deleteButton.type = "button";
+    deleteButton.className = "review-reply-delete";
+    deleteButton.textContent = "Delete";
+    deleteButton.addEventListener("click", async function (event) {
+      event.stopPropagation();
+      if (window.confirm("Delete this reply?")) {
+        await deleteComment(reply.id);
+      }
+    });
+    actions.appendChild(deleteButton);
+
+    replyEl.appendChild(actions);
+    return replyEl;
+  }
+
+  // Swaps a comment's (or reply's) text for an inline editor. Cancel puts the
+  // original text back, Save posts the new body and re-renders from the server.
+  function startEditing(item, textEl, actionsEl) {
+    const editor = document.createElement("div");
+    editor.className = "review-edit";
+    editor.innerHTML = `
+      <textarea class="review-edit-body" rows="4"></textarea>
+      <div class="review-composer-error" hidden></div>
+      <div class="review-edit-actions">
+        <button type="button" class="review-edit-cancel">Cancel</button>
+        <button type="button" class="review-edit-save">Save</button>
+      </div>
+    `;
+    const textarea = editor.querySelector(".review-edit-body");
+    const errorEl = editor.querySelector(".review-composer-error");
+    textarea.value = item.body || "";
+    editor.addEventListener("click", function (event) {
+      event.stopPropagation();
+    });
+
+    function stopEditing() {
+      editor.replaceWith(textEl);
+      actionsEl.hidden = false;
+    }
+
+    editor.querySelector(".review-edit-cancel").addEventListener("click", stopEditing);
+    editor.querySelector(".review-edit-save").addEventListener("click", async function () {
+      const body = textarea.value.trim();
+      if (!body) {
+        errorEl.textContent = "Comment text is required.";
+        errorEl.hidden = false;
+        textarea.focus();
+        return;
+      }
+      if (body === String(item.body || "").trim()) {
+        stopEditing();
+        return;
+      }
+      await editComment(item.id, body);
+    });
+
+    textEl.replaceWith(editor);
+    actionsEl.hidden = true;
+    textarea.focus();
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+  }
+
+  async function editComment(commentId, body) {
+    try {
+      await api(`/api/comments/${commentId}/edit`, { body: body });
+      await refreshComments();
+    } catch (err) {
+      console.error(err);
+      window.alert("Could not update comment.");
+    }
+  }
+
+  async function deleteComment(commentId) {
+    try {
+      await api(`/api/comments/${commentId}/delete`, {});
+      if (Number(activeCommentId) === Number(commentId)) {
+        clearActiveComment();
+      }
+      await refreshComments();
+    } catch (err) {
+      console.error(err);
+      window.alert("Could not delete comment.");
+    }
   }
 
   function buildUrlFor(pagePath) {
@@ -1007,11 +1141,58 @@
     }
   }
 
-  function replyTo(commentId, rect) {
-    showCommentComposer(rect, function (reviewer, body) {
-      setReviewerName(reviewer);
-      postReply(commentId, reviewer, body);
+  // The floating composer is positioned over the page and would sit behind
+  // this panel, so replies are typed in a box inside the comment card itself.
+  function startReplying(commentId, card, actionsEl) {
+    const existing = card.querySelector(".review-reply-box");
+    if (existing) {
+      existing.querySelector(".review-edit-body").focus();
+      return;
+    }
+    const box = document.createElement("div");
+    box.className = "review-edit review-reply-box";
+    box.innerHTML = `
+      <input type="text" class="review-reply-reviewer" placeholder="Your name" value="${escapeHtml(getReviewerName())}">
+      <textarea class="review-edit-body" placeholder="Write a reply" rows="3"></textarea>
+      <div class="review-composer-error" hidden></div>
+      <div class="review-edit-actions">
+        <button type="button" class="review-edit-cancel">Cancel</button>
+        <button type="button" class="review-edit-save">Reply</button>
+      </div>
+    `;
+    const reviewerInput = box.querySelector(".review-reply-reviewer");
+    const textarea = box.querySelector(".review-edit-body");
+    const errorEl = box.querySelector(".review-composer-error");
+    box.addEventListener("click", function (event) {
+      event.stopPropagation();
     });
+    box.querySelector(".review-edit-cancel").addEventListener("click", function () {
+      box.remove();
+    });
+    box.querySelector(".review-edit-save").addEventListener("click", async function () {
+      const reviewer = reviewerInput.value.trim();
+      const body = textarea.value.trim();
+      if (!reviewer) {
+        errorEl.textContent = "Enter your name to reply.";
+        errorEl.hidden = false;
+        reviewerInput.focus();
+        return;
+      }
+      if (!body) {
+        errorEl.textContent = "Reply text is required.";
+        errorEl.hidden = false;
+        textarea.focus();
+        return;
+      }
+      setReviewerName(reviewer);
+      await postReply(commentId, reviewer, body);
+    });
+    actionsEl.after(box);
+    if (getReviewerName()) {
+      textarea.focus();
+    } else {
+      reviewerInput.focus();
+    }
   }
 
   async function postReply(commentId, reviewer, body) {
@@ -1084,6 +1265,45 @@
       card.scrollIntoView({ block: "center" });
     }
     return true;
+  }
+
+  // Fills el with text, turning http(s) URLs into links that open in a new tab.
+  // Built from DOM nodes (never innerHTML) so comment text can't inject markup.
+  function appendLinkified(el, text) {
+    const urlPattern = /https?:\/\/[^\s<>]+/gi;
+    const closers = { ")": "(", "]": "[", "}": "{" };
+    let last = 0;
+    let match;
+    while ((match = urlPattern.exec(text)) !== null) {
+      let url = match[0];
+      // Leave trailing punctuation (and unbalanced closing brackets) outside the link.
+      while (url) {
+        const end = url.charAt(url.length - 1);
+        const opener = closers[end];
+        const unbalanced = opener && url.split(end).length > url.split(opener).length;
+        if (".,;:!?'\"".indexOf(end) !== -1 || unbalanced) {
+          url = url.slice(0, -1);
+        } else {
+          break;
+        }
+      }
+      if (!/^https?:\/\/[^/\s]/i.test(url)) {
+        continue;
+      }
+      el.appendChild(document.createTextNode(text.slice(last, match.index)));
+      const link = document.createElement("a");
+      link.className = "review-link";
+      link.href = url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = url;
+      link.addEventListener("click", function (event) {
+        event.stopPropagation();
+      });
+      el.appendChild(link);
+      last = match.index + url.length;
+    }
+    el.appendChild(document.createTextNode(text.slice(last)));
   }
 
   function escapeHtml(value) {

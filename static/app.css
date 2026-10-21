@@ -263,6 +263,69 @@ tr.is-archived .status.archived {
   margin-bottom: 10px;
 }
 
+/* Comments page: reply threads */
+.comment-thread {
+  margin-top: 10px;
+}
+
+.comment-thread-label {
+  color: #5d6a7c;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+
+.thread-replies {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 12px;
+  border-left: 2px solid #d9e2ef;
+  display: grid;
+  gap: 8px;
+}
+
+.thread-reply {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #f8fbff;
+}
+
+.thread-avatar {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: #dbe8fb;
+  color: #17418a;
+  font-size: 0.75rem;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.thread-reply-main {
+  min-width: 0;
+}
+
+.thread-reply-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+}
+
+.thread-reply-body {
+  margin-top: 2px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .actions {
   display: flex;
   flex-wrap: wrap;
@@ -685,4 +748,13 @@ blockquote {
   .diff-sidebar {
     width: 100%;
   }
+}
+
+.comment-body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.comment-link {
+  overflow-wrap: anywhere;
 }

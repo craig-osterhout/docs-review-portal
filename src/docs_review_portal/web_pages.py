@@ -31,6 +31,7 @@ from docs_review_portal.helpers import (
     compute_delete_at,
     format_ts,
     html_page,
+    linkify_html,
     parse_local_datetime_to_ts,
     slugify_tag,
 )
@@ -359,6 +360,33 @@ class ReviewPagesMixin:
                 if is_diff_comment
                 else f"<div class=\"subtle\">lines {comment.get('line_start') or '-'} - {comment.get('line_end') or '-'}</div>"
             )
+            replies = comment.get("replies") or []
+            thread_markup = ""
+            if replies:
+                reply_count_label = f"{len(replies)} {'reply' if len(replies) == 1 else 'replies'}"
+                reply_items = "".join(
+                    f"""
+                    <li class="thread-reply">
+                      <span class="thread-avatar" aria-hidden="true">{html.escape((str(reply.get('reviewer') or '?').strip() or '?')[:1].upper())}</span>
+                      <div class="thread-reply-main">
+                        <div class="thread-reply-head">
+                          <strong>{html.escape(str(reply.get('reviewer') or 'reviewer'))}</strong>
+                          <span class="subtle">{html.escape(str(reply.get('created_at_human') or ''))}</span>
+                          {'<span class="subtle">(edited)</span>' if reply.get('edited_at') else ''}
+                        </div>
+                        <div class="thread-reply-body">{linkify_html(str(reply.get('body') or ''))}</div>
+                      </div>
+                    </li>
+                    """
+                    for reply in replies
+                )
+                thread_markup = f"""
+                    <div class="comment-thread">
+                      <div class="comment-thread-label">{reply_count_label}</div>
+                      <ol class="thread-replies">{reply_items}</ol>
+                    </div>
+                """
+            edited_markup = ' <span class="subtle">(edited)</span>' if comment.get("edited_at") else ""
             comment_rows.append(
                 f"""
                 <tr id="review-comment-{comment['id']}"{row_class}>
@@ -371,8 +399,9 @@ class ReviewPagesMixin:
                   <td>{comment['created_at_human']}</td>
                   <td>{status_markup}</td>
                   <td>
-                    <a class="comment-page-link" href="{html.escape(location)}">{html.escape(str(comment['body']))}</a>
+                    <div class="comment-body">{linkify_html(str(comment['body']))}{edited_markup}</div>
                     {f"<blockquote>{html.escape(str(comment['selected_text']))}</blockquote>" if comment.get('selected_text') else ""}
+                    {thread_markup}
                   </td>
                 </tr>
                 """
