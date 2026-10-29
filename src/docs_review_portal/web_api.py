@@ -58,14 +58,17 @@ from docs_review_portal.config import (
     normalize_rewrite_host,
 )
 from docs_review_portal.data import (
+    count_outdated_comments,
     create_comment,
     delete_comment,
     fetch_page_comments,
     fetch_page_diff,
     get_build_by_id,
     get_build_rewrite_host,
+    get_latest_build_for_key,
     import_build_archive_path,
     list_builds,
+    review_key_of,
     normalize_selection_payload,
     set_comment_resolved,
     update_build_changed_pages,
@@ -76,6 +79,7 @@ from docs_review_portal.helpers import (
     canonical_page_path,
     compute_delete_at,
     format_ts,
+    review_url,
     slugify_tag,
 )
 
@@ -84,12 +88,19 @@ from docs_review_portal.helpers import (
 class ReviewApiMixin:
     def _api_get_builds(self) -> None:
         rows = list_builds()
+        latest_versions: dict[str, int] = {}
+        for row in rows:
+            key = review_key_of(row)
+            latest_versions[key] = max(latest_versions.get(key, 0), int(row["version"] or 1))
         payload = {
             "builds": [
                 {
                     "id": int(row["id"]),
                     "image_ref": row["image_ref"],
                     "tag": row["tag"],
+                    "review_key": review_key_of(row),
+                    "version": int(row["version"] or 1),
+                    "is_latest": int(row["version"] or 1) == latest_versions[review_key_of(row)],
                     "display_name": row["display_name"],
                     "created_at": int(row["created_at"]),
                     "created_at_human": format_ts(int(row["created_at"])),
@@ -104,7 +115,12 @@ class ReviewApiMixin:
                         if row["archived_at"] is not None
                         else None
                     ),
-                    "site_url": build_url(str(row["tag"]), base=self._public_base()),
+                    "site_url": review_url(
+                        review_key_of(row),
+                        int(row["version"] or 1),
+                        int(row["version"] or 1) == latest_versions[review_key_of(row)],
+                        base=self._public_base(),
+                    ),
                 }
                 for row in rows
             ]
@@ -236,9 +252,11 @@ class ReviewApiMixin:
         if failed:
             self._write_chunk(f"error: {failed['error']}\n".encode())
         else:
+            imported = get_latest_build_for_key(tag)
             result = json.dumps({
                 "tag": tag,
                 "name": display_name,
+                "version": int(imported["version"] or 1) if imported else 1,
                 "rewrite_host": rewrite_host or None,
                 "site_url": build_url(tag, base=self._public_base()),
             })
@@ -251,8 +269,21 @@ class ReviewApiMixin:
         if not build_raw.isdigit():
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "build_id is required"})
             return
-        comments = fetch_page_comments(int(build_raw), canonical_page_path(page_path))
-        self._send_json(HTTPStatus.OK, {"comments": comments})
+        build_id = int(build_raw)
+        canonical = canonical_page_path(page_path)
+        comments = fetch_page_comments(build_id, canonical)
+        build = get_build_by_id(build_id)
+        # Outdated comments on this page, and on the whole review (other pages included).
+        outdated_page_count = count_outdated_comments(build, canonical) if build else 0
+        outdated_count = count_outdated_comments(build) if build else 0
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "comments": comments,
+                "outdated_count": outdated_count,
+                "outdated_page_count": outdated_page_count,
+            },
+        )
 
     def _api_create_comment(self) -> None:
         payload = self._read_json()
@@ -271,6 +302,8 @@ class ReviewApiMixin:
             kind = str(payload.get("kind") or "preview")
             diff_start_key = payload.get("diff_start_key")
             diff_end_key = payload.get("diff_end_key")
+            context_before = payload.get("context_before")
+            context_after = payload.get("context_after")
             if line_start is not None:
                 line_start = int(line_start)
             if line_end is not None:
@@ -290,6 +323,8 @@ class ReviewApiMixin:
                 kind=kind,
                 diff_start_key=str(diff_start_key) if diff_start_key else None,
                 diff_end_key=str(diff_end_key) if diff_end_key else None,
+                context_before=context_before,
+                context_after=context_after,
             )
         except Exception as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -310,40 +345,119 @@ class ReviewApiMixin:
             return
         self._send_json(HTTPStatus.OK, {"status": "ok", "resolved": resolved})
 
-    def _render_logs_page(self) -> None:
-        entries = log_buffer.get_entries()
-        level_class = {"ERROR": "archived", "WARNING": "open", "INFO": "resolved"}
+    def _render_logs_page(self, query: dict[str, list[str]] | None = None) -> None:
+        from urllib.parse import urlencode
+
+        from docs_review_portal.config import LOG_RETENTION_DAYS
+        from docs_review_portal.helpers import html_page
+
+        query = query or {}
+        page_size = 200
+        level = (query.get("level", ["all"])[0] or "all").lower()
+        if level not in ("all", "warning", "error"):
+            level = "all"
+        search = (query.get("q", [""])[0] or "").strip()
+        instance = (query.get("instance", [""])[0] or "").strip()
+        page_raw = query.get("page", ["1"])[0]
+        page_number = int(page_raw) if page_raw.isdigit() and int(page_raw) > 0 else 1
+
+        notice = ""
+        instances: list[str] = []
+        has_older = False
+        try:
+            entries, has_older = log_buffer.query_entries(
+                level=level, search=search, instance=instance,
+                limit=page_size, offset=(page_number - 1) * page_size,
+            )
+            instances = log_buffer.list_instances()
+        except Exception:
+            # The saved logs can't be read right now, so show what this process remembers.
+            notice = (
+                '<p class="subtle archive-note">Saved logs are unavailable, so this shows only '
+                "recent entries from this instance.</p>"
+            )
+            entries = list(reversed(log_buffer.get_entries()))
+            if level != "all":
+                wanted = ("WARNING", "ERROR", "CRITICAL") if level == "warning" else ("ERROR", "CRITICAL")
+                entries = [e for e in entries if e["level"] in wanted]
+            if search:
+                needle = search.lower()
+                entries = [e for e in entries if needle in e["msg"].lower() or needle in e["logger"].lower()]
+            page_number = 1
+
+        level_class = {"CRITICAL": "archived", "ERROR": "archived", "WARNING": "open", "INFO": "resolved"}
         rows = "".join(
             f"<tr>"
             f"<td>{_html.escape(e['ts_human'])}</td>"
             f"<td><span class=\"status {level_class.get(e['level'], '')}\">{_html.escape(e['level'])}</span></td>"
+            f"<td><span class=\"subtle\">{_html.escape(e.get('instance') or '')}</span></td>"
             f"<td>{_html.escape(e['logger'])}</td>"
-            f"<td><code>{_html.escape(e['msg'])}</code></td>"
+            f"<td><pre class=\"log-message\">{_html.escape(e['msg'])}</pre></td>"
             f"</tr>"
-            for e in reversed(entries)
+            for e in entries
         )
+
+        def page_link(number: int, label: str) -> str:
+            params = {"level": level, "q": search, "instance": instance, "page": str(number)}
+            params = {k: v for k, v in params.items() if v and not (k == "level" and v == "all")}
+            return f'<a href="/logs?{_html.escape(urlencode(params))}">{label}</a>'
+
+        pager = []
+        if page_number > 1:
+            pager.append(page_link(page_number - 1, "&larr; Newer"))
+        if has_older:
+            pager.append(page_link(page_number + 1, "Older &rarr;"))
+        pager_markup = f'<p class="log-pager">{" ".join(pager)}</p>' if pager else ""
+
+        instance_options = ['<option value="">All instances</option>']
+        for name in instances + ([instance] if instance and instance not in instances else []):
+            selected = " selected" if name == instance else ""
+            current = " (this instance)" if name == log_buffer.INSTANCE_ID else ""
+            instance_options.append(
+                f'<option value="{_html.escape(name)}"{selected}>{_html.escape(name)}{current}</option>'
+            )
+        level_options = "".join(
+            f'<option value="{value}"{" selected" if level == value else ""}>{label}</option>'
+            for value, label in (("all", "All levels"), ("warning", "Warnings and errors"), ("error", "Errors only"))
+        )
+
         body = f"""
         <section class="panel">
-          <h1>Logs</h1>
-          <p><a href="/logs">Refresh</a></p>
+          <h1>System logs</h1>
+          <p class="subtle">Logs are saved for {LOG_RETENTION_DAYS} days and survive restarts.
+             This instance is <code>{_html.escape(log_buffer.INSTANCE_ID)}</code>.</p>
+          {notice}
+          <form class="filter-form" method="get" action="/logs">
+            <label>Level
+              <select name="level">{level_options}</select>
+            </label>
+            <label>Instance
+              <select name="instance">{''.join(instance_options)}</select>
+            </label>
+            <label>Search
+              <input type="text" name="q" value="{_html.escape(search)}" placeholder="Message or logger">
+            </label>
+            <button type="submit">Apply</button>
+          </form>
         </section>
         <section class="panel">
           <table>
             <thead>
               <tr>
-                <th>Time</th>
+                <th>Time (UTC)</th>
                 <th>Level</th>
+                <th>Instance</th>
                 <th>Logger</th>
                 <th>Message</th>
               </tr>
             </thead>
             <tbody>
-              {rows or '<tr><td colspan="4">No log entries yet.</td></tr>'}
+              {rows or '<tr><td colspan="5">No log entries match.</td></tr>'}
             </tbody>
           </table>
+          {pager_markup}
         </section>"""
-        from docs_review_portal.helpers import html_page
-        self._send_html(HTTPStatus.OK, html_page("Logs", body))
+        self._send_html(HTTPStatus.OK, html_page("System logs", body))
 
     def _api_reply_comment(self, path: str) -> None:
         match = re.match(r"^/api/comments/(\d+)/reply$", path)

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import atexit
 import re
+import signal
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -90,7 +92,7 @@ class ReviewHandler(
             self._api_get_comments(query)
             return
         if path == "/logs":
-            self._render_logs_page()
+            self._render_logs_page(query)
             return
         if self._serve_build_from_tagged_path(path):
             return
@@ -154,6 +156,16 @@ def serve() -> None:
         "starting: version=%s storage=%s data_dir=%s db=%s", BUILD_VERSION, SITE_STORAGE_BACKEND, DATA_DIR, DB_BACKEND
     )
     init_storage()
+    # Logs are saved to the database from here on, anything logged above is queued.
+    log_buffer.start_db_writer()
+    atexit.register(log_buffer.flush)
+
+    def _flush_logs_and_exit(signum: int, frame: object) -> None:
+        # Cloud Run sends SIGTERM when it stops an instance, so save what is queued first.
+        log_buffer.flush()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _flush_logs_and_exit)
     try:
         purge_expired_archived_builds()
     except Exception:

@@ -14,40 +14,51 @@ import time
 from docs_review_portal import import_status
 from docs_review_portal.data import (
     create_comment,
-    delete_build_and_comments,
+    delete_review,
     fetch_build_comments_for_export,
     fetch_build_for_export,
     fetch_feedback,
     get_build_by_id,
-    list_builds,
+    list_reviews,
     mark_build_archived,
     restore_archived_build,
+    review_context_for,
+    review_key_of,
     set_comment_resolved,
+    version_of,
 )
 from docs_review_portal.helpers import (
     build_path,
-    build_url,
     canonical_page_path,
     compute_delete_at,
     format_ts,
     html_page,
     linkify_html,
     parse_local_datetime_to_ts,
+    review_path,
+    review_url,
     slugify_tag,
 )
 
 
 class ReviewPagesMixin:
     def _render_previews_page(self) -> None:
-        rows = list_builds()
+        reviews = list_reviews()
         build_rows = []
-        for row in rows:
+        for review in reviews:
+            # A review with several versions shows as one row for its latest version.
+            row = review["latest"]
+            versions = review["versions"]
+            version_count = len(versions)
+            latest_version = version_of(row)
             build_id = int(row["id"])
-            tag_raw = str(row["tag"])
+            tag_raw = str(review["key"])
             tag = html.escape(tag_raw)
             name_raw = (str(row["display_name"]) if row["display_name"] is not None else "").strip() or tag_raw
             name = html.escape(name_raw)
             preview_display = f"<strong>{name}</strong>"
+            if version_count > 1:
+                preview_display = f'{preview_display} <span class="version-badge">v{latest_version}</span>'
             if name_raw != tag_raw:
                 preview_display = f"{preview_display}<br><span class=\"subtle\">{tag}</span>"
             changed_pages_raw = row["changed_pages"] if "changed_pages" in row.keys() else None
@@ -62,6 +73,47 @@ class ReviewPagesMixin:
             comments = int(row["comment_count"] or 0)
             open_comments = int(row["open_comment_count"] or 0)
             updated_at = int(row["updated_at"] or row["created_at"])
+            site_href = html.escape(review_url(tag_raw, latest_version, True, base=self._public_base()))
+            comments_cell = f'<a href="/comments?build_id={build_id}">{open_comments} open / {comments} total</a>'
+            versions_action = ""
+            delete_scope = "this preview and all associated comments"
+            if version_count > 1:
+                comments_cell = (
+                    f'<a href="/comments?build_id={build_id}">{open_comments} open / {comments} total</a>'
+                    f'<br><a class="subtle" href="/comments?build_id={build_id}&amp;version=all">'
+                    f'{review["total_open_comment_count"]} open / {review["total_comment_count"]} total across all versions</a>'
+                )
+                delete_scope = f"this preview, all {version_count} of its versions and all associated comments"
+                version_items = []
+                for version_row in reversed(versions):
+                    v_num = version_of(version_row)
+                    v_id = int(version_row["id"])
+                    v_is_latest = v_num == latest_version
+                    v_href = html.escape(review_url(tag_raw, v_num, v_is_latest, base=self._public_base()))
+                    v_open = int(version_row["open_comment_count"] or 0)
+                    v_total = int(version_row["comment_count"] or 0)
+                    v_date = html.escape(format_ts(int(version_row["created_at"])))
+                    version_items.append(
+                        f'''<li class="version-menu-item">
+                          <div class="version-menu-title"><strong>v{v_num}</strong>{' <span class="version-badge">latest</span>' if v_is_latest else ''}
+                            <span class="subtle">{v_date}</span></div>
+                          <div class="version-menu-links">
+                            <a href="{v_href}">View preview</a>
+                            <a href="/comments?build_id={v_id}&amp;version={v_num}">{v_open} open / {v_total} total</a>
+                          </div>
+                        </li>'''
+                    )
+                versions_action = f'''
+                      <details class="version-menu">
+                        <summary class="icon-action" title="Versions" aria-label="Versions">
+                          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                            <path d="M12 3l9 5-9 5-9-5z"></path>
+                            <path d="M3 13l9 5 9-5"></path>
+                            <path d="M3 17.5l9 5 9-5"></path>
+                          </svg>
+                        </summary>
+                        <ul class="version-menu-list">{"".join(version_items)}</ul>
+                      </details>'''
             action_path = f"/previews/{build_id}/delete"
             restore_path = f"/previews/{build_id}/restore"
             row_class = " class=\"is-archived\"" if archived_at is not None else ""
@@ -76,7 +128,7 @@ class ReviewPagesMixin:
                         </svg>
                       </button>
                     </form>
-                    <form method="post" action="{destroy_path}" onsubmit="return confirm('Permanently delete this preview and all comments right now? This cannot be undone.');">
+                    <form method="post" action="{destroy_path}" onsubmit="return confirm('Permanently delete {delete_scope} right now? This cannot be undone.');">
                       <button type="submit" class="icon-action icon-danger" title="Delete immediately" aria-label="Delete immediately">
                         <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                           <path d="M3 6h18"></path>
@@ -90,7 +142,7 @@ class ReviewPagesMixin:
                 """
             else:
                 action_form = f"""
-                    <form method="post" action="{action_path}" onsubmit="return confirm('Schedule deletion for this preview and all associated comments in 7 days?');">
+                    <form method="post" action="{action_path}" onsubmit="return confirm('Schedule deletion for {delete_scope} in 7 days?');">
                       <button type="submit" class="icon-action icon-danger" title="Schedule delete" aria-label="Schedule delete">
                         <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                           <path d="M3 6h18"></path>
@@ -107,18 +159,19 @@ class ReviewPagesMixin:
                 <tr{row_class}>
                   <td>{preview_display}</td>
                   <td>{format_ts(updated_at)}</td>
-                  <td><a href="{build_url(tag_raw, base=self._public_base())}">View preview</a><br>
+                  <td><a href="{site_href}">View preview</a><br>
                       <span class="subtle">{urlparse(self._public_base()).netloc}{build_path(tag_raw)}</span></td>
-                  <td><a href="/comments?build_id={build_id}">{open_comments} open / {comments} total</a></td>
+                  <td>{comments_cell}</td>
                   <td>
                     <div class="preview-actions">
+                      {versions_action}
                       <a class="icon-action" href="/previews/{build_id}/changed-pages" title="Changed pages" aria-label="Changed pages">
                         <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                           <path d="M8 6h13"></path><path d="M8 12h13"></path><path d="M8 18h13"></path>
                           <path d="M3 6h.01"></path><path d="M3 12h.01"></path><path d="M3 18h.01"></path>
                         </svg>
                       </a>
-                      <a class="icon-action" href="/previews/{build_id}/comments.csv" title="Export comments" aria-label="Export comments">
+                      <a class="icon-action" href="/previews/{build_id}/comments.csv" title="{'Export comments from all versions' if version_count > 1 else 'Export comments'}" aria-label="Export comments">
                         <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                           <path d="M12 3v11"></path>
                           <path d="M7 10l5 5 5-5"></path>
@@ -176,6 +229,7 @@ class ReviewPagesMixin:
           <pre class="code-hint">REVIEW_SERVICE_URL={html.escape(self._public_base())} \\
   bash &lt;(curl -fsSL https://raw.githubusercontent.com/craig-osterhout/docs-review-portal/refs/heads/main/scripts/publish-branch.sh) &lt;name&gt; \\
   --docs-path /path/to/local/docs</pre>
+          <p class="subtle" style="margin:12px 0 0">Running it again with the same name uploads a new version of that preview. Reviewers see the latest version by default and can switch to older versions, which keep their comments. Open comments are carried forward when their text is still on the page.</p>
         </dialog>
         <script>
           (function () {{
@@ -184,6 +238,13 @@ class ReviewPagesMixin:
             document.getElementById('close-upload-dialog').addEventListener('click', function () {{ dialog.close(); }});
             dialog.addEventListener('click', function (e) {{ if (e.target === dialog) dialog.close(); }});
           }})();
+        </script>
+        <script>
+          document.addEventListener('click', function (e) {{
+            document.querySelectorAll('details.version-menu[open]').forEach(function (d) {{
+              if (!d.contains(e.target)) {{ d.open = false; }}
+            }});
+          }});
         </script>
         <section class="panel">
           <table>
@@ -236,6 +297,8 @@ class ReviewPagesMixin:
                 "created_at_human",
                 "resolved_at_unix",
                 "resolved_at_human",
+                "version",
+                "carried_from_comment_id",
             ]
         )
         for comment in comments:
@@ -257,18 +320,36 @@ class ReviewPagesMixin:
                     str(comment.get("created_at_human") or ""),
                     int(comment["resolved_at"]) if comment.get("resolved_at") else "",
                     str(comment.get("resolved_at_human") or ""),
+                    int(comment.get("build_version") or 1),
+                    comment.get("carried_from_id") or "",
                 ]
             )
 
-        safe_tag = slugify_tag(str(build["tag"]))
+        safe_tag = slugify_tag(review_key_of(build))
         filename = f"{safe_tag}-comments.csv"
         self._send_csv(HTTPStatus.OK, filename, out.getvalue())
 
     def _render_comments_page(self, query: dict[str, list[str]]) -> None:
-        builds = list_builds()
+        reviews = list_reviews()
         selected_build_id = query.get("build_id", [""])[0]
+        version_input = (query.get("version", ["latest"])[0] or "latest").strip().lower()
+        version_filter: str | int = int(version_input) if version_input.isdigit() else (
+            "all" if version_input == "all" else "latest"
+        )
         selected_reviewer = query.get("reviewer", [""])[0]
-        selected_resolved = query.get("resolved", ["all"])[0]
+        status_labels = {"open": "Open", "outdated": "Outdated", "resolved": "Resolved"}
+        status_names = tuple(status_labels)
+        selected_statuses = [name for name in query.get("status", []) if name in status_names]
+        legacy_resolved = query.get("resolved", [""])[0]
+        if not selected_statuses and legacy_resolved:
+            # Older links used a single resolved filter.
+            selected_statuses = {"unresolved": ["open"], "resolved": ["resolved"]}.get(legacy_resolved, [])
+        selected_statuses = list(dict.fromkeys(selected_statuses))
+        # What the status dropdown shows when closed. Nothing chosen means every status.
+        if not selected_statuses or len(selected_statuses) == len(status_names):
+            status_summary = "All statuses"
+        else:
+            status_summary = ", ".join(status_labels[name] for name in status_names if name in selected_statuses)
         from_input = query.get("from", [""])[0]
         to_input = query.get("to", [""])[0]
         sort_key = query.get("sort", ["created_at"])[0]
@@ -279,17 +360,24 @@ class ReviewPagesMixin:
         filters = {
             "build_id": int(selected_build_id) if selected_build_id.isdigit() else None,
             "reviewer": selected_reviewer.strip() or None,
-            "resolved": selected_resolved,
+            "statuses": selected_statuses,
             "from_ts": parse_local_datetime_to_ts(from_input),
             "to_ts": parse_local_datetime_to_ts(to_input, end_of_minute=True),
+            "version": version_filter,
         }
         comments = fetch_feedback(filters, sort_key=sort_key, sort_dir=sort_dir)
 
         options = ['<option value="">All previews</option>']
-        for build in builds:
+        selected_review = None
+        for review in reviews:
+            # The option's value is the latest version's id, any version's id selects the review.
+            build = review["latest"]
             build_id = str(build["id"])
-            selected = " selected" if selected_build_id == build_id else ""
-            build_tag = str(build["tag"])
+            is_selected = selected_build_id in {str(v["id"]) for v in review["versions"]}
+            if is_selected:
+                selected_review = review
+            selected = " selected" if is_selected else ""
+            build_tag = str(review["key"])
             build_name = (str(build["display_name"]) if build["display_name"] is not None else "").strip() or build_tag
             archived_raw = build["archived_at"] if "archived_at" in build.keys() else None
             archived_at = int(archived_raw) if archived_raw is not None else None
@@ -302,23 +390,35 @@ class ReviewPagesMixin:
                 f'<option value="{build_id}"{selected}>{html.escape(option_label)}</option>'
             )
 
+        version_options = [
+            f'<option value="latest"{" selected" if version_filter == "latest" else ""}>Latest version</option>',
+            f'<option value="all"{" selected" if version_filter == "all" else ""}>All versions</option>',
+        ]
+        if selected_review is not None:
+            for version_row in reversed(selected_review["versions"]):
+                v_num = version_of(version_row)
+                version_options.append(
+                    f'<option value="{v_num}"{" selected" if version_filter == v_num else ""}>Version {v_num}</option>'
+                )
+
         def sort_link(column: str, label: str) -> str:
             next_dir = "desc" if sort_key == column and sort_dir == "asc" else "asc"
-            params: dict[str, str] = {}
+            params: list[tuple[str, str]] = []
             if selected_build_id:
-                params["build_id"] = selected_build_id
+                params.append(("build_id", selected_build_id))
             if selected_reviewer:
-                params["reviewer"] = selected_reviewer
-            if selected_resolved:
-                params["resolved"] = selected_resolved
+                params.append(("reviewer", selected_reviewer))
+            params.extend(("status", name) for name in selected_statuses)
+            if version_input != "latest":
+                params.append(("version", version_input))
             if from_input:
-                params["from"] = from_input
+                params.append(("from", from_input))
             if to_input:
-                params["to"] = to_input
+                params.append(("to", to_input))
             if embed:
-                params["embed"] = "1"
-            params["sort"] = column
-            params["dir"] = next_dir
+                params.append(("embed", "1"))
+            params.append(("sort", column))
+            params.append(("dir", next_dir))
             arrow = ""
             if sort_key == column:
                 arrow = " (↑)" if sort_dir == "asc" else " (↓)"
@@ -329,7 +429,13 @@ class ReviewPagesMixin:
         for comment in comments:
             resolved_label = "resolved" if comment["resolved"] else "open"
             is_diff_comment = comment.get("kind") == "diff"
-            location = build_url(str(comment["build_tag"]), str(comment["page_path"]), base=self._public_base())
+            location = review_url(
+                str(comment["build_tag"]),
+                int(comment["build_version"]),
+                bool(comment["is_latest_version"]),
+                str(comment["page_path"]),
+                base=self._public_base(),
+            )
             hash_fragment = "review-diff-comment" if is_diff_comment else "review-comment"
             location = f"{location}#{hash_fragment}-{comment['id']}"
             archived_raw = comment.get("build_archived_at")
@@ -344,6 +450,11 @@ class ReviewPagesMixin:
                 if build_name == build_tag
                 else f"{html.escape(build_name)}<br><span class=\"subtle\">{html.escape(build_tag)}</span>"
             )
+            version_cell = f'v{int(comment["build_version"])}'
+            if comment.get("carried_from_version") is not None:
+                version_cell += (
+                    f'<br><span class="subtle">carried from v{int(comment["carried_from_version"])}</span>'
+                )
             if archived_at is not None and delete_at is not None:
                 preview_label = (
                     f"{preview_label}<br>"
@@ -351,15 +462,22 @@ class ReviewPagesMixin:
                 )
 
             status_badges = [f'<span class="status {resolved_label}">{resolved_label}</span>']
+            if comment.get("outdated"):
+                status_badges.append(
+                    '<span class="status outdated" title="On an earlier version, with no copy on the latest one">outdated</span>'
+                )
+
             if archived_at is not None:
                 status_badges.append('<span class="status archived">pending delete</span>')
             status_markup = " ".join(status_badges)
 
-            page_meta = (
-                '<div class="subtle">diff comment</div>'
-                if is_diff_comment
-                else f"<div class=\"subtle\">lines {comment.get('line_start') or '-'} - {comment.get('line_end') or '-'}</div>"
-            )
+            if is_diff_comment:
+                page_meta = '<div class="subtle">diff comment</div>'
+            elif comment.get("line_start") or comment.get("line_end"):
+                page_meta = f"<div class=\"subtle\">lines {comment.get('line_start') or '-'} - {comment.get('line_end') or '-'}</div>"
+            else:
+                # Carried forward from an earlier version, so there are no line numbers.
+                page_meta = ""
             replies = comment.get("replies") or []
             thread_markup = ""
             if replies:
@@ -391,6 +509,7 @@ class ReviewPagesMixin:
                 f"""
                 <tr id="review-comment-{comment['id']}"{row_class}>
                   <td>{preview_label}</td>
+                  <td>{version_cell}</td>
                   <td>
                     <a class="comment-page-link" href="{html.escape(location)}">{html.escape(str(comment['page_path']))}</a>
                     {page_meta}
@@ -407,7 +526,7 @@ class ReviewPagesMixin:
                 """
             )
         comments_markup = (
-            "\n".join(comment_rows) if comment_rows else "<tr><td colspan='6'>No comments match the current filters.</td></tr>"
+            "\n".join(comment_rows) if comment_rows else "<tr><td colspan='7'>No comments match the current filters.</td></tr>"
         )
 
         body = f"""
@@ -417,16 +536,25 @@ class ReviewPagesMixin:
             <label>Preview
               <select name="build_id">{''.join(options)}</select>
             </label>
+            <label>Version
+              <select name="version">{''.join(version_options)}</select>
+            </label>
             <label>Reviewer
               <input type="text" name="reviewer" value="{html.escape(selected_reviewer)}" placeholder="Name">
             </label>
-            <label>Status
-              <select name="resolved">
-                <option value="all"{' selected' if selected_resolved == 'all' else ''}>All</option>
-                <option value="unresolved"{' selected' if selected_resolved == 'unresolved' else ''}>Unresolved</option>
-                <option value="resolved"{' selected' if selected_resolved == 'resolved' else ''}>Resolved</option>
-              </select>
-            </label>
+            <div class="status-filter">
+              <span class="status-filter-title">Status</span>
+              <details class="status-dropdown">
+                <summary id="status-dropdown-label">{html.escape(status_summary)}</summary>
+                <div class="status-dropdown-menu">
+                  {''.join(
+                      f'<label><input type="checkbox" name="status" value="{name}"'
+                      f'{" checked" if name in selected_statuses or not selected_statuses else ""}> {html.escape(status_labels[name])}</label>'
+                      for name in status_names
+                  )}
+                </div>
+              </details>
+            </div>
             <label>From (UTC)
               <input type="datetime-local" name="from" value="{html.escape(from_input)}">
             </label>
@@ -444,6 +572,7 @@ class ReviewPagesMixin:
             <thead>
               <tr>
                 <th>{sort_link("preview", "Preview")}</th>
+                <th>{sort_link("version", "Version")}</th>
                 <th>{sort_link("page_path", "Page")}</th>
                 <th>{sort_link("reviewer", "Reviewer")}</th>
                 <th>{sort_link("created_at", "Created")}</th>
@@ -456,6 +585,28 @@ class ReviewPagesMixin:
             </tbody>
           </table>
         </section>
+        <script>
+        (function() {{
+          var dropdown = document.querySelector('details.status-dropdown');
+          if (!dropdown) {{ return; }}
+          var label = document.getElementById('status-dropdown-label');
+          var boxes = dropdown.querySelectorAll('input[name="status"]');
+          function refreshLabel() {{
+            var names = [];
+            boxes.forEach(function(box) {{
+              if (box.checked) {{ names.push(box.parentNode.textContent.trim()); }}
+            }});
+            label.textContent = (names.length === 0 || names.length === boxes.length) ? 'All statuses' : names.join(', ');
+          }}
+          boxes.forEach(function(box) {{ box.addEventListener('change', refreshLabel); }});
+          document.addEventListener('click', function(e) {{
+            if (dropdown.open && !dropdown.contains(e.target)) {{ dropdown.open = false; }}
+          }});
+          document.addEventListener('keydown', function(e) {{
+            if (e.key === 'Escape' && dropdown.open) {{ dropdown.open = false; }}
+          }});
+        }})();
+        </script>
         {f'''<script>
         (function() {{
           if (window.parent && window.parent !== window) {{
@@ -493,7 +644,7 @@ class ReviewPagesMixin:
         if not match:
             self.send_error(HTTPStatus.NOT_FOUND, "Action not found")
             return
-        delete_build_and_comments(int(match.group(1)))
+        delete_review(int(match.group(1)))
         self._redirect("/previews")
 
     def _feedback_toggle_resolved(self, path: str) -> None:
@@ -549,7 +700,14 @@ class ReviewPagesMixin:
         embed = (query.get("embed", ["0"])[0] or "0") == "1"
         select_raw = (query.get("select", [""])[0] or "").strip()
 
-        tag = str(build["tag"])
+        review = review_context_for(build)
+        tag = str(review["reviewKey"])
+        url_prefix = str(review["urlPrefix"])
+        version_label = (
+            f"version {review['version']}" if len(review["versions"]) > 1 else ""
+        )
+        # New comments go on the latest version only. Older ones allow replies.
+        can_comment = review["version"] == review["latestVersion"]
         name_raw = (str(build["display_name"]) if build["display_name"] is not None else "").strip() or tag
         raw = build["changed_pages"] if "changed_pages" in build.keys() else None
         pages = [ln.strip() for ln in str(raw).splitlines() if ln.strip()] if raw else []
@@ -588,7 +746,15 @@ class ReviewPagesMixin:
             status_cls = "status-modified" if has_diff else "status-added"
             status_label = "M" if has_diff else "A"
             status_title = "Modified &mdash; diff available" if has_diff else "Added &mdash; no diff available"
-            preview_link = html.escape(build_url(tag, p, base=self._public_base()))
+            preview_link = html.escape(
+                review_url(
+                    tag,
+                    int(review["version"]),
+                    review["version"] == review["latestVersion"],
+                    p,
+                    base=self._public_base(),
+                )
+            )
             return f"""<button type="button" class="file-select-btn" title="{p_esc}">
                 <span class="file-status-badge {status_cls}" title="{status_title}">{status_label}</span>
                 <span class="file-path">{label_esc}</span>
@@ -631,8 +797,10 @@ class ReviewPagesMixin:
           {'' if embed else '<p><a href="/previews">&larr; Back to previews</a></p>'}
           <h1>Changed pages</h1>
           <p>Preview: <strong>{html.escape(name_raw)}</strong>
-             {f'<span class="subtle">({html.escape(tag)})</span>' if name_raw != tag else ''}</p>
+             {f'<span class="subtle">({html.escape(tag)})</span>' if name_raw != tag else ''}
+             {f'<span class="version-badge">{html.escape(version_label)}</span>' if version_label else ''}</p>
           <p class="subtle" id="page-count">{len(pages)} page{"s" if len(pages) != 1 else ""}</p>
+          {'' if can_comment else '<p class="subtle">New comments are turned off on older versions. You can still reply to existing comments.</p>'}
 
           <div class="diff-page-layout">
             <div class="diff-sidebar">
@@ -650,6 +818,10 @@ class ReviewPagesMixin:
             mode: "diff",
             buildId: {build_id},
             buildTag: {json.dumps(tag)},
+            urlPrefix: {json.dumps(url_prefix)},
+            version: {review["version"]},
+            latestVersion: {review["latestVersion"]},
+            versions: {json.dumps(review["versions"])},
             pagePath: {json.dumps(selected_page)},
           }};
         </script>
@@ -658,10 +830,11 @@ class ReviewPagesMixin:
         <script>
         (function() {{
           var BUILD_ID = {build_id};
-          var tag = {json.dumps(tag)};
+          var urlPrefix = {json.dumps(url_prefix)};
           var baseUrl = {json.dumps(self._public_base())};
           var EMBED = {json.dumps(embed)};
           var HIGHLIGHT_COMMENT_ID = {json.dumps(highlight_comment_id)};
+          var CAN_COMMENT = {json.dumps(can_comment)};
           var REVIEWER_KEY = 'docs-review-reviewer';
           var HAS_PARENT_WIDGET = EMBED && window.parent && window.parent !== window;
           var list = document.getElementById('changed-pages-list');
@@ -709,7 +882,7 @@ class ReviewPagesMixin:
           }}
 
           function buildUrlFor(p) {{
-            return baseUrl + '/' + tag + p;
+            return baseUrl + urlPrefix + p;
           }}
 
           function wireSelect(li) {{
@@ -1151,6 +1324,10 @@ class ReviewPagesMixin:
 
           function handleDiffSelection(table, pagePath) {{
             removeDiffComposer();
+            if (!CAN_COMMENT) {{
+              removeFloatingAddBtn();
+              return;
+            }}
             var selection = window.getSelection();
             if (!selection || selection.isCollapsed || selection.rangeCount === 0) {{
               removeFloatingAddBtn();

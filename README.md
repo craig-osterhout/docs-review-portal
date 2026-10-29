@@ -104,6 +104,10 @@ Open:
 - `http://localhost:8080/logs`
 - `http://localhost:8080/healthz`
 
+## System logs
+
+The **System logs** page (`/logs`) shows the app's logs, saved in the database so they survive restarts and are shared by every instance. Entries are kept for 30 days (set `REVIEW_LOG_RETENTION_DAYS` to change this). The page filters by level, instance and text, and each entry shows which instance wrote it. If the database can't be written to, the app keeps running and logs still go to stdout.
+
 ## Upload a preview
 
 The **Upload preview** button on the `/previews` page shows the publish script command to copy. It builds, packages and uploads the docs site for you:
@@ -115,6 +119,22 @@ REVIEW_SERVICE_URL=https://<service-url> \
 ```
 
 The script handles chunking automatically for large archives. To upload an archive for any other static site, use the API below.
+
+## Versions
+
+Uploading to a preview name that already exists creates a new version of that preview instead of overwriting it. Older versions keep their files and comments, so you can restructure a review (move, add or delete pages) without losing the context of earlier feedback.
+
+- `/<name>/` always shows the latest version. Older versions live at `/<name>/_v/<n>/`.
+- Switching to a version that doesn't have the current page (it was added, moved or removed in between) shows a 404 that lists the versions which do have it.
+- The comments panel has a version dropdown. Older versions show a banner and do not accept new comments, but their comments can still be replied to, resolved, edited and deleted.
+- When a new version is uploaded, open comments from the previous version are carried forward if the text they were attached to is still on the same page. Each new comment also saves a short stretch of text on either side of the highlight. When the same words appear several times on a page, that surrounding text picks the right occurrence, and a comment is carried forward only if the text next to it on at least one side still matches. Comments made before this was added are matched on the highlighted text alone. Comments that can't be matched (reworded text, moved or removed pages, diff comments) stay on the old version and are marked **outdated**.
+- `/previews` shows one row per preview with its latest version. The versions icon in **Actions** lists every version. The comments column shows counts for the latest version and across all versions.
+- `/comments` shows the latest version by default. The **Version** filter switches to all versions or a single one.
+- Export comments includes every version, with `version` and `carried_from_comment_id` columns.
+- Deleting a preview schedules all of its versions. Uploading to the name of a preview that is waiting to be deleted starts a fresh preview.
+- PR previews imported by the GitHub poller are still overwritten in place on each push, so they don't gain a version per commit.
+
+Existing previews become version 1 of their own preview, so nothing changes for them until a new version is uploaded.
 
 ## Changed pages
 

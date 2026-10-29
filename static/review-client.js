@@ -16,6 +16,12 @@
   // different file open (see __reviewSetActivePage) and restored to this
   // once the modal closes — the widget is a single instance either way.
   const basePagePath = ctx.pagePath;
+  // Reviews can have several versions. The latest one lives at /<name>/ and
+  // older ones under /<name>/_v/<n>/, each with its own comments.
+  const REVIEW_KEY = ctx.reviewKey || ctx.buildTag;
+  const VERSIONS = Array.isArray(ctx.versions) ? ctx.versions : [];
+  const HAS_VERSIONS = VERSIONS.length > 1;
+  const VIEWING_OLD_VERSION = HAS_VERSIONS && Number(ctx.version) !== Number(ctx.latestVersion);
   const CONTENT_ROOT = document.querySelector("main") || document.body;
   const HAS_CUSTOM_HIGHLIGHT_API =
     typeof window.Highlight === "function" &&
@@ -35,6 +41,7 @@
   let lastHandledHash = null;
   let commentComposer = null;
   let composerCleanup = null;
+  let outdatedNote = null;
 
   if (!DIFF_MODE) {
     assignLineNumbers();
@@ -219,7 +226,162 @@
     }
   }
 
+  // How much page text on each side of a highlight is saved with the comment. It is
+  // what tells apart repeats of the same words, such as one "the" among many.
+  const CONTEXT_CHARS = 80;
+  const SKIPPED_TEXT = "script,style,noscript,svg,.review-panel,.review-comment-composer,.review-floating-action";
+
+  // The text nodes of the page that a reader would select from, in order.
+  function pageTextNodes() {
+    const nodes = [];
+    const walker = document.createTreeWalker(CONTENT_ROOT, NodeFilter.SHOW_TEXT);
+    let node = walker.nextNode();
+    while (node) {
+      const parent = node.parentElement;
+      if (parent && !parent.closest(SKIPPED_TEXT)) {
+        nodes.push(node);
+      }
+      node = walker.nextNode();
+    }
+    return nodes;
+  }
+
+  // The page text just before and after a selection, saved when a comment is made.
+  function selectionContext(range) {
+    const nodes = pageTextNodes();
+    const starts = new Map();
+    let full = "";
+    nodes.forEach(function (node) {
+      starts.set(node, full.length);
+      full += node.nodeValue || "";
+    });
+    function indexOfBoundary(container, offset) {
+      if (starts.has(container)) {
+        return starts.get(container) + Math.min(offset, (container.nodeValue || "").length);
+      }
+      // The boundary sits between elements, so use the first text at or after it.
+      const probe = document.createRange();
+      probe.setStart(container, offset);
+      probe.collapse(true);
+      for (const node of nodes) {
+        if (probe.comparePoint(node, 0) >= 0) {
+          return starts.get(node);
+        }
+      }
+      return full.length;
+    }
+    try {
+      const start = indexOfBoundary(range.startContainer, range.startOffset);
+      const end = indexOfBoundary(range.endContainer, range.endOffset);
+      const tidy = function (text) { return text.replace(/\s+/g, " ").trim(); };
+      return {
+        before: tidy(full.slice(0, start)).slice(-CONTEXT_CHARS).trim(),
+        after: tidy(full.slice(end)).slice(0, CONTEXT_CHARS).trim(),
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function commonSuffixLength(a, b) {
+    let n = 0;
+    while (n < a.length && n < b.length && a.charAt(a.length - 1 - n) === b.charAt(b.length - 1 - n)) {
+      n += 1;
+    }
+    return n;
+  }
+
+  function commonPrefixLength(a, b) {
+    let n = 0;
+    while (n < a.length && n < b.length && a.charAt(n) === b.charAt(n)) {
+      n += 1;
+    }
+    return n;
+  }
+
+  // Finds selected text again by its characters, ignoring whitespace. Comments
+  // carried forward from an earlier version have no saved position, and for them
+  // this is how the highlight finds the text on the new page. When the same text
+  // appears several times, the saved surroundings pick the right one.
+  function locateTextRange(text, contextBefore, contextAfter) {
+    const wanted = String(text || "").replace(/\s+/g, "");
+    if (!wanted) {
+      return null;
+    }
+    const spots = [];
+    const chars = [];
+    pageTextNodes().forEach(function (node) {
+      const value = node.nodeValue || "";
+      for (let i = 0; i < value.length; i += 1) {
+        if (!/\s/.test(value.charAt(i))) {
+          chars.push(value.charAt(i));
+          spots.push({ node: node, offset: i });
+        }
+      }
+    });
+    const joined = chars.join("");
+    const before = String(contextBefore || "").replace(/\s+/g, "");
+    const after = String(contextAfter || "").replace(/\s+/g, "");
+    const hasContext = contextBefore != null || contextAfter != null;
+    // Same rule as the server: the characters nearest the highlight on each side say
+    // whether it is the same spot, and a side with nothing saved says nothing.
+    const NEAR_CHARS = 30;
+    function sideScores(at) {
+      const scores = [];
+      if (before) {
+        const near = Math.min(before.length, NEAR_CHARS);
+        const around = joined.slice(Math.max(0, at - before.length), at);
+        scores.push(Math.min(commonSuffixLength(before, around), near) / near);
+      }
+      if (after) {
+        const near = Math.min(after.length, NEAR_CHARS);
+        const around = joined.slice(at + wanted.length, at + wanted.length + after.length);
+        scores.push(Math.min(commonPrefixLength(after, around), near) / near);
+      }
+      return scores;
+    }
+    let best = -1;
+    let bestScore = -1;
+    for (let at = joined.indexOf(wanted); at !== -1; at = joined.indexOf(wanted, at + 1)) {
+      let score = 0;
+      if (hasContext) {
+        const scores = sideScores(at);
+        score = scores.length ? scores.reduce(function (a, b) { return a + b; }, 0) / scores.length : 1;
+      }
+      if (score > bestScore) {
+        best = at;
+        bestScore = score;
+      }
+      if (!hasContext) {
+        break;
+      }
+    }
+    if (best < 0) {
+      return null;
+    }
+    const start = spots[best];
+    const end = spots[best + wanted.length - 1];
+    try {
+      const range = document.createRange();
+      range.setStart(start.node, start.offset);
+      range.setEnd(end.node, end.offset + 1);
+      return range;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function rangeForComment(comment) {
+    return deserializeRange(comment.selection) ||
+      locateTextRange(comment.selected_text, comment.context_before, comment.context_after);
+  }
+
   function onSelectionComplete() {
+    if (VIEWING_OLD_VERSION) {
+      // Older versions are read only for new comments. Replies still work.
+      hideFloatingButton();
+      return;
+    }
     const sel = window.getSelection();
     if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
       hideFloatingButton();
@@ -241,9 +403,12 @@
     const startLine = nearestLine(range.startContainer);
     const endLine = nearestLine(range.endContainer);
 
+    const context = selectionContext(range);
     pendingSelection = {
       selectedText: text,
       selection: serializedSelection,
+      contextBefore: context ? context.before : null,
+      contextAfter: context ? context.after : null,
       lineStart:
         startLine != null && endLine != null ? Math.min(startLine, endLine) : null,
       lineEnd:
@@ -494,6 +659,79 @@
     try { window.localStorage.setItem(PANEL_VISIBLE_KEY, visible ? "1" : "0"); } catch (_) {}
   }
 
+  function versionPrefix(version) {
+    return Number(version) === Number(ctx.latestVersion)
+      ? "/" + REVIEW_KEY
+      : "/" + REVIEW_KEY + "/_v/" + Number(version);
+  }
+
+  function versionBarMarkup() {
+    if (!HAS_VERSIONS) {
+      return "";
+    }
+    const options = VERSIONS.slice()
+      .sort(function (a, b) { return b.version - a.version; })
+      .map(function (item) {
+        const label = "Version " + item.version + (Number(item.version) === Number(ctx.latestVersion) ? " (latest)" : "");
+        const selected = Number(item.version) === Number(ctx.version) ? " selected" : "";
+        return '<option value="' + item.version + '"' + selected + ">" + escapeHtml(label) + "</option>";
+      })
+      .join("");
+    const banner = VIEWING_OLD_VERSION
+      ? '<div class="review-version-banner">You are viewing an older version. <a href="#" id="review-go-latest">View the latest version</a></div>'
+      : "";
+    return (
+      '<div class="review-version-bar"><label>Version <select id="review-version-select" autocomplete="off">' +
+      options +
+      "</select></label></div>" +
+      banner
+    );
+  }
+
+  // Opens the same page in another version. If that version doesn't have the page
+  // (it was added, moved or removed in between), the server answers with a 404 that
+  // says which versions do have it.
+  function goToVersion(version) {
+    if (!Number.isFinite(version) || version === Number(ctx.version)) {
+      return;
+    }
+    if (DIFF_MODE) {
+      const target = VERSIONS.find(function (item) { return Number(item.version) === version; });
+      if (target) {
+        window.location.href = "/previews/" + encodeURIComponent(String(target.buildId)) + "/changed-pages";
+      }
+      return;
+    }
+    // Pages are folders on the site, so keep the trailing slash it uses.
+    const pagePart = basePagePath === "/" || /\.[a-z0-9]+$/i.test(basePagePath) ? basePagePath : basePagePath + "/";
+    window.location.href = versionPrefix(version) + pagePart;
+  }
+
+  // Says so when open comments on this page, from earlier versions, were not carried
+  // forward. Pages with none of their own show nothing.
+  function renderOutdatedNote(pageCount) {
+    if (!outdatedNote) {
+      return;
+    }
+    outdatedNote.textContent = "";
+    if (VIEWING_OLD_VERSION || !pageCount) {
+      outdatedNote.hidden = true;
+      return;
+    }
+    const label = (pageCount === 1 ? "1 open comment" : pageCount + " open comments") +
+      " on this page from an earlier version could not be carried forward. ";
+    outdatedNote.appendChild(document.createTextNode(label));
+    const link = document.createElement("a");
+    link.href = "#";
+    link.textContent = "View outdated comments";
+    link.addEventListener("click", function (event) {
+      event.preventDefault();
+      openCommentsModal("all", "outdated");
+    });
+    outdatedNote.appendChild(link);
+    outdatedNote.hidden = false;
+  }
+
   function createPanel() {
     const aside = document.createElement("aside");
     aside.className = "review-panel";
@@ -525,7 +763,13 @@
             </button>
           </div>
         </div>
-        <div class="review-comment-hint">Highlight text on the page to add comments.</div>
+        ${versionBarMarkup()}
+        <div class="review-comment-hint">${
+          VIEWING_OLD_VERSION
+            ? "New comments are turned off on older versions. You can still reply to existing comments."
+            : "Highlight text on the page to add comments."
+        }</div>
+        <div id="review-outdated-note" class="review-outdated-note" hidden></div>
         <div id="review-panel-body">Loading...</div>
       </div>
     `;
@@ -558,8 +802,31 @@
 
     var viewAllCommentsBtn = aside.querySelector("#review-view-all-comments");
     if (viewAllCommentsBtn) {
-      viewAllCommentsBtn.addEventListener("click", openCommentsModal);
+      viewAllCommentsBtn.addEventListener("click", function () {
+        openCommentsModal();
+      });
     }
+
+    var versionSelect = aside.querySelector("#review-version-select");
+    if (versionSelect) {
+      versionSelect.addEventListener("change", function () {
+        goToVersion(Number(versionSelect.value));
+      });
+      // Going back to this page (for example from the 404 for a version that lacks
+      // it) can restore the dropdown on the version that was picked. It must always
+      // show the version this page is.
+      window.addEventListener("pageshow", function () {
+        versionSelect.value = String(ctx.version);
+      });
+    }
+    var latestLink = aside.querySelector("#review-go-latest");
+    if (latestLink) {
+      latestLink.addEventListener("click", function (event) {
+        event.preventDefault();
+        goToVersion(Number(ctx.latestVersion));
+      });
+    }
+    outdatedNote = aside.querySelector("#review-outdated-note");
 
     return aside;
   }
@@ -652,8 +919,14 @@
     openModal("Changed pages", url);
   }
 
-  function openCommentsModal() {
-    var url = "/comments?embed=1&build_id=" + encodeURIComponent(String(ctx.buildId));
+  // Shows the version being viewed unless a version is given ("all" for every one).
+  function openCommentsModal(version, status) {
+    var chosen = version || (VIEWING_OLD_VERSION ? String(ctx.version) : "latest");
+    var url = "/comments?embed=1&build_id=" + encodeURIComponent(String(ctx.buildId))
+      + "&version=" + encodeURIComponent(chosen);
+    if (status) {
+      url += "&status=" + encodeURIComponent(status);
+    }
     openModal("Comments", url);
   }
 
@@ -690,6 +963,8 @@
       lineStart: selectionData.lineStart,
       lineEnd: selectionData.lineEnd,
       selectedText: selectionData.selectedText,
+      contextBefore: selectionData.contextBefore,
+      contextAfter: selectionData.contextAfter,
       selection: selectionData.selection
         ? JSON.parse(JSON.stringify(selectionData.selection))
         : null,
@@ -709,6 +984,8 @@
       line_start: selectionData.lineStart,
       line_end: selectionData.lineEnd,
       selection: selectionData.selection,
+      context_before: selectionData.contextBefore,
+      context_after: selectionData.contextAfter,
     };
     try {
       await api("/api/comments", payload);
@@ -733,6 +1010,7 @@
       const data = await response.json();
       commentsCache = Array.isArray(data.comments) ? data.comments : [];
       renderComments(commentsCache);
+      renderOutdatedNote(Number(data.outdated_page_count) || 0);
       pushHighlightsToDiffModal();
     } catch (err) {
       console.error(err);
@@ -796,7 +1074,9 @@
 
     const meta = document.createElement("div");
     meta.className = "review-comment-meta";
-    meta.textContent = `${comment.created_at_human || ""}${comment.edited_at ? " (edited)" : ""}`;
+    meta.textContent = `${comment.created_at_human || ""}${comment.edited_at ? " (edited)" : ""}${
+      comment.carried_from_version ? " \u00b7 carried from v" + comment.carried_from_version : ""
+    }`;
     card.appendChild(meta);
 
     const text = document.createElement("p");
@@ -1016,7 +1296,7 @@
   }
 
   function buildUrlFor(pagePath) {
-    return "/" + ctx.buildTag + pagePath;
+    return (ctx.urlPrefix || "/" + ctx.buildTag) + pagePath;
   }
 
   function openPreviewForComment(comment) {
@@ -1082,7 +1362,7 @@
     highlightComment(comment);
 
     if (scrollToTarget) {
-      const selectedRange = deserializeRange(comment.selection);
+      const selectedRange = rangeForComment(comment);
       if (selectedRange) {
         const rect = selectedRange.getBoundingClientRect();
         if (rect && Number.isFinite(rect.top) && Number.isFinite(rect.height)) {
@@ -1102,7 +1382,7 @@
   }
 
   function highlightComment(comment) {
-    const selectedRange = deserializeRange(comment.selection);
+    const selectedRange = rangeForComment(comment);
     if (selectedRange && HAS_CUSTOM_HIGHLIGHT_API) {
       const key = comment.resolved ? HIGHLIGHT_KEY_RESOLVED : HIGHLIGHT_KEY_OPEN;
       window.CSS.highlights.set(key, new window.Highlight(selectedRange));

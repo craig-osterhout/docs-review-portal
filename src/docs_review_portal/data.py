@@ -4,6 +4,7 @@ import json
 import logging as _logging
 import mimetypes
 import re
+from html.parser import HTMLParser
 import shutil
 import sqlite3
 import tarfile
@@ -34,6 +35,7 @@ from docs_review_portal.helpers import (
     canonical_page_path,
     format_ts,
     now_ts,
+    review_path,
     rewrite_docs_domain_urls,
     slugify_tag,
 )
@@ -87,6 +89,9 @@ def db_connect() -> DBConnectionProxy:
     return DBConnectionProxy(conn)
 
 
+# Storage tag for versions after the first is "<review key>~v<n>". slugify_tag never
+# produces "~", so a version tag can't collide with a name someone uploads.
+_VERSION_TAG_SEPARATOR = "~"
 _CHANGED_PAGES_FILE = ".changed-pages"  # reserved filename in upload archives
 _DIFFS_DIR = ".diffs"  # reserved directory prefix for per-page diff files
 
@@ -542,6 +547,17 @@ def init_storage() -> None:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_page_diffs_build_page ON page_diffs(build_id, page_path);
+
+                CREATE TABLE IF NOT EXISTS logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts INTEGER NOT NULL,
+                    level TEXT NOT NULL,
+                    logger TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    instance TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts);
                 """
             )
             columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(builds)").fetchall()}
@@ -564,6 +580,18 @@ def init_storage() -> None:
                 conn.execute("ALTER TABLE comments ADD COLUMN diff_end_key TEXT")
             if "edited_at" not in comment_columns:
                 conn.execute("ALTER TABLE comments ADD COLUMN edited_at INTEGER")
+            if "review_key" not in columns:
+                conn.execute("ALTER TABLE builds ADD COLUMN review_key TEXT")
+            if "version" not in columns:
+                conn.execute("ALTER TABLE builds ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+            if "carried_from_id" not in comment_columns:
+                conn.execute("ALTER TABLE comments ADD COLUMN carried_from_id INTEGER")
+            if "context_before" not in comment_columns:
+                conn.execute("ALTER TABLE comments ADD COLUMN context_before TEXT")
+            if "context_after" not in comment_columns:
+                conn.execute("ALTER TABLE comments ADD COLUMN context_after TEXT")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_builds_review_key ON builds(review_key)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_comments_carried_from ON comments(carried_from_id)")
         else:
             conn.executescript(
                 """
@@ -608,6 +636,13 @@ def init_storage() -> None:
                 ALTER TABLE comments ADD COLUMN IF NOT EXISTS diff_start_key TEXT;
                 ALTER TABLE comments ADD COLUMN IF NOT EXISTS diff_end_key TEXT;
                 ALTER TABLE comments ADD COLUMN IF NOT EXISTS edited_at BIGINT;
+                ALTER TABLE builds ADD COLUMN IF NOT EXISTS review_key TEXT;
+                ALTER TABLE builds ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1;
+                ALTER TABLE comments ADD COLUMN IF NOT EXISTS carried_from_id BIGINT;
+                ALTER TABLE comments ADD COLUMN IF NOT EXISTS context_before TEXT;
+                ALTER TABLE comments ADD COLUMN IF NOT EXISTS context_after TEXT;
+                CREATE INDEX IF NOT EXISTS idx_builds_review_key ON builds(review_key);
+                CREATE INDEX IF NOT EXISTS idx_comments_carried_from ON comments(carried_from_id);
 
                 CREATE TABLE IF NOT EXISTS page_diffs (
                     id BIGSERIAL PRIMARY KEY,
@@ -617,10 +652,23 @@ def init_storage() -> None:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_page_diffs_build_page ON page_diffs(build_id, page_path);
+
+                CREATE TABLE IF NOT EXISTS logs (
+                    id BIGSERIAL PRIMARY KEY,
+                    ts BIGINT NOT NULL,
+                    level TEXT NOT NULL,
+                    logger TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    instance TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts);
                 """
             )
 
         conn.execute("UPDATE builds SET updated_at = created_at WHERE updated_at IS NULL")
+        # Existing previews become version 1 of a review named after their tag.
+        conn.execute("UPDATE builds SET review_key = tag WHERE review_key IS NULL")
         conn.execute(
             "UPDATE builds SET rewrite_host = ? WHERE rewrite_host IS NULL",
             (DEFAULT_REWRITE_HOST,),
@@ -868,14 +916,44 @@ def import_build_archive_path(
     source_ref: str | None = None,
     rewrite_host: str = DEFAULT_REWRITE_HOST,
     stage_callback: Callable[[str], None] | None = None,
+    new_version: bool = True,
 ) -> ImportedBuild:
-    resolved_tag = slugify_tag(tag)
-    resolved_name = (display_name or resolved_tag).strip() or resolved_tag
-    site_dir = BUILDS_DIR / resolved_tag / "site"
+    """Import an archive as a preview.
+
+    Uploading to a name that already exists creates the next version of that
+    review and carries matching open comments forward. Pass new_version=False
+    to overwrite the latest version in place instead (used for PR previews that
+    are refreshed on every push).
+    """
+    review_key = slugify_tag(tag)
+    resolved_name = (display_name or review_key).strip() or review_key
     stored_rewrite_host = ""
     if rewrite_host:
         stored_rewrite_host = normalize_rewrite_host(rewrite_host) or DEFAULT_REWRITE_HOST
-    had_existing_site = SITE_STORE.begin_replace(resolved_tag)
+
+    group = list_review_versions(review_key)
+    latest = group[-1] if group else None
+    if latest is not None and new_version and latest["archived_at"] is not None:
+        # The review was deleted and is only waiting out the grace period, so a
+        # new upload under the same name starts fresh instead of reviving it.
+        for old_row in group:
+            delete_build_and_comments(int(old_row["id"]), delete_storage=str(old_row["tag"]) != review_key)
+        group = []
+        latest = None
+
+    overwrite = latest is not None and not new_version
+    if latest is None:
+        version = 1
+        storage_tag = review_key
+    elif overwrite:
+        version = version_of(latest)
+        storage_tag = str(latest["tag"])
+    else:
+        version = version_of(latest) + 1
+        storage_tag = f"{review_key}{_VERSION_TAG_SEPARATOR}v{version}"
+
+    site_dir = BUILDS_DIR / storage_tag / "site"
+    had_existing_site = SITE_STORE.begin_replace(storage_tag)
 
     if stage_callback:
         stage_callback("Extracting preview files")
@@ -885,9 +963,9 @@ def import_build_archive_path(
             stage_callback(f"Importing file {n} of {total}")
 
     try:
-        changed_pages = SITE_STORE.replace_site_from_archive(archive_path, resolved_tag, progress_callback=_progress if stage_callback else None)
+        changed_pages = SITE_STORE.replace_site_from_archive(archive_path, storage_tag, progress_callback=_progress if stage_callback else None)
     except Exception:
-        SITE_STORE.rollback_replace(resolved_tag, had_existing_site)
+        SITE_STORE.rollback_replace(storage_tag, had_existing_site)
         raise
 
     page_diffs_map = _extract_diffs_from_archive(archive_path)
@@ -897,10 +975,9 @@ def import_build_archive_path(
     if stage_callback:
         stage_callback("Updating preview metadata")
     with db_connect() as conn:
-        existing = conn.execute("SELECT id FROM builds WHERE tag = ?", (resolved_tag,)).fetchone()
-        image_ref = source_ref or f"upload:{resolved_tag}"
-        if existing:
-            build_id = int(existing["id"])
+        image_ref = source_ref or f"upload:{review_key}"
+        if overwrite:
+            build_id = int(latest["id"])
             conn.execute(
                 """
                 UPDATE builds
@@ -911,36 +988,40 @@ def import_build_archive_path(
                 (image_ref, resolved_name, stored_rewrite_host, changed_pages, diff_pages, now, build_id),
             )
         else:
+            insert_sql = """
+                INSERT INTO builds (image_ref, tag, display_name, rewrite_host, changed_pages, diff_pages,
+                                    review_key, version, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
+            values = (
+                image_ref, storage_tag, resolved_name, stored_rewrite_host, changed_pages, diff_pages,
+                review_key, version, now, now,
+            )
             if DB_BACKEND == "postgres":
-                inserted = conn.execute(
-                    """
-                    INSERT INTO builds (image_ref, tag, display_name, rewrite_host, changed_pages, diff_pages, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    RETURNING id
-                    """,
-                    (image_ref, resolved_tag, resolved_name, stored_rewrite_host, changed_pages, diff_pages, now, now),
-                ).fetchone()
+                inserted = conn.execute(f"{insert_sql} RETURNING id", values).fetchone()
                 if not inserted:
                     raise ValueError("failed to create preview metadata")
                 build_id = int(inserted["id"])
             else:
-                cur = conn.execute(
-                    """
-                    INSERT INTO builds (image_ref, tag, display_name, rewrite_host, changed_pages, diff_pages, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (image_ref, resolved_tag, resolved_name, stored_rewrite_host, changed_pages, diff_pages, now, now),
-                )
+                cur = conn.execute(insert_sql, values)
                 build_id = int(cur.lastrowid)
         store_page_diffs(conn, build_id, page_diffs_map)
+        if latest is not None and not overwrite:
+            if stage_callback:
+                stage_callback("Carrying comments forward")
+            carried, outdated = carry_comments_forward(conn, latest, build_id, storage_tag)
+            _logging.getLogger(__name__).info(
+                "%r v%d: carried %d comment(s) forward, %d left outdated", review_key, version, carried, outdated
+            )
         conn.commit()
 
     return ImportedBuild(
         build_id=build_id,
-        tag=resolved_tag,
+        tag=review_key,
         image_ref=image_ref,
         display_name=resolved_name,
         extracted_to=site_dir,
+        version=version,
     )
 
 
@@ -975,6 +1056,7 @@ class ImportedBuild:
     image_ref: str
     display_name: str
     extracted_to: Path
+    version: int = 1
 
 def inject_review_bundle(site_root: Path, build_id: int, tag: str) -> None:
     marker_pattern = re.compile(
@@ -1019,6 +1101,382 @@ def update_build_changed_pages(build_id: int, pages: list[str]) -> bool:
     return True
 
 
+def version_of(row: Any) -> int:
+    value = row["version"] if "version" in row.keys() else None
+    return int(value or 1)
+
+
+def review_key_of(row: Any) -> str:
+    value = row["review_key"] if "review_key" in row.keys() else None
+    return str(value or row["tag"])
+
+
+# Highest version number of the review that the builds row aliased as "b" belongs to.
+_LATEST_VERSION_SQL = (
+    "(SELECT MAX(COALESCE(lv.version, 1)) FROM builds lv "
+    "WHERE COALESCE(lv.review_key, lv.tag) = COALESCE(b.review_key, b.tag))"
+)
+
+
+def list_review_versions(review_key: str) -> list[Any]:
+    """All versions of a review, oldest first."""
+    with db_connect() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM builds
+            WHERE COALESCE(review_key, tag) = ?
+            ORDER BY COALESCE(version, 1) ASC, id ASC
+            """,
+            (review_key,),
+        ).fetchall()
+
+
+def get_latest_build_for_key(review_key: str) -> Any | None:
+    with db_connect() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM builds
+            WHERE COALESCE(review_key, tag) = ?
+            ORDER BY COALESCE(version, 1) DESC, id DESC
+            LIMIT 1
+            """,
+            (review_key,),
+        ).fetchone()
+
+
+def get_build_version(review_key: str, version: int) -> Any | None:
+    with db_connect() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM builds
+            WHERE COALESCE(review_key, tag) = ? AND COALESCE(version, 1) = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (review_key, version),
+        ).fetchone()
+
+
+def review_context_for(build: Any) -> dict[str, Any]:
+    """Version details the in-page review widget needs for the build being served."""
+    key = review_key_of(build)
+    rows = list_review_versions(key)
+    version = version_of(build)
+    latest_version = max((version_of(r) for r in rows), default=version)
+    is_latest = version == latest_version
+    return {
+        "reviewKey": key,
+        "version": version,
+        "latestVersion": latest_version,
+        "urlPrefix": review_path(key, version, is_latest).rstrip("/"),
+        "versions": [
+            {
+                "version": version_of(r),
+                "buildId": int(r["id"]),
+                "createdAtHuman": format_ts(r["created_at"]),
+            }
+            for r in rows
+        ],
+    }
+
+
+class _VisibleTextParser(HTMLParser):
+    """Collects the text a reader sees, preferring what is inside <main>, which is
+    the part of the page the comment widget lets people select."""
+
+    _SKIP_TAGS = {"script", "style", "noscript", "template", "svg"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._skip_depth = 0
+        self._main_depth = 0
+        self.main_parts: list[str] = []
+        self.all_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self._SKIP_TAGS:
+            self._skip_depth += 1
+        elif tag == "main":
+            self._main_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._SKIP_TAGS:
+            self._skip_depth = max(0, self._skip_depth - 1)
+        elif tag == "main":
+            self._main_depth = max(0, self._main_depth - 1)
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
+        self.all_parts.append(data)
+        if self._main_depth:
+            self.main_parts.append(data)
+
+
+def _normalize_for_match(text: str) -> str:
+    # Whitespace differs between a text selection and the page source (line breaks
+    # between blocks, indentation), so matching ignores it entirely.
+    return re.sub(r"\s+", "", text)
+
+
+# How much page text before and after a highlight is saved with a comment. It is what
+# tells apart repeats of the same words, such as a comment on one "the" of many.
+CONTEXT_CHARS = 80
+# Only the characters closest to the highlight are compared, since that is what says
+# whether it is still the same spot. Either side matching this well is enough, so a
+# neighbouring sentence being added or removed doesn't lose the comment.
+_NEAR_CHARS = 30
+_SIDE_MATCH = 0.7
+# A selection this long that appears exactly once is trusted even if its surroundings changed.
+_UNIQUE_SELECTION_CHARS = 40
+
+
+def clean_context(value: Any) -> str | None:
+    """Context text from a client, tidied up. None means no context was sent."""
+    if not isinstance(value, str):
+        return None
+    return re.sub(r"\s+", " ", value).strip()[:CONTEXT_CHARS * 2]
+
+
+def _common_suffix_len(a: str, b: str) -> int:
+    n = 0
+    while n < len(a) and n < len(b) and a[-1 - n] == b[-1 - n]:
+        n += 1
+    return n
+
+
+def _common_prefix_len(a: str, b: str) -> int:
+    n = 0
+    while n < len(a) and n < len(b) and a[n] == b[n]:
+        n += 1
+    return n
+
+
+def _locate_selection(
+    page_text: str,
+    selected_text: str,
+    context_before: str | None,
+    context_after: str | None,
+) -> tuple[str, str] | None:
+    """Find where a comment's highlighted text sits in a page of a newer version.
+
+    The highlighted text has to appear on the page. When the comment saved the text
+    around it, that decides which occurrence is meant and whether the surroundings
+    still look the same. Returns the context to save at the new position, or None
+    when the comment no longer fits.
+    """
+    collapsed = re.sub(r"\s+", " ", page_text).strip()
+    # Matching ignores whitespace, so keep a way back from positions in the
+    # stripped text to positions in the readable one.
+    positions = [i for i, ch in enumerate(collapsed) if not ch.isspace()]
+    stripped = "".join(collapsed[i] for i in positions)
+    wanted = _normalize_for_match(selected_text)
+    if not wanted:
+        return None
+    starts: list[int] = []
+    found = stripped.find(wanted)
+    while found != -1:
+        starts.append(found)
+        found = stripped.find(wanted, found + 1)
+    if not starts:
+        return None
+
+    has_context = context_before is not None or context_after is not None
+    if has_context:
+        before = _normalize_for_match(context_before or "")
+        after = _normalize_for_match(context_after or "")
+
+        def side_scores(pos: int) -> list[float]:
+            """How well each saved side of the context matches at pos. A side with
+            nothing saved (the highlight was at the edge of the page) says nothing."""
+            scores: list[float] = []
+            if before:
+                near = min(len(before), _NEAR_CHARS)
+                around = stripped[max(0, pos - len(before)):pos]
+                scores.append(min(_common_suffix_len(before, around), near) / near)
+            if after:
+                near = min(len(after), _NEAR_CHARS)
+                around = stripped[pos + len(wanted):pos + len(wanted) + len(after)]
+                scores.append(min(_common_prefix_len(after, around), near) / near)
+            return scores
+
+        def rank(pos: int) -> float:
+            scores = side_scores(pos)
+            return sum(scores) / len(scores) if scores else 1.0
+
+        best = max(starts, key=lambda pos: (rank(pos), -pos))
+        best_sides = side_scores(best)
+        follows_context = not best_sides or max(best_sides) >= _SIDE_MATCH
+        long_and_unique = len(starts) == 1 and len(wanted) >= _UNIQUE_SELECTION_CHARS
+        if not follows_context and not long_and_unique:
+            return None
+    else:
+        # Comments saved before context was kept can only go on the text.
+        best = starts[0]
+
+    start = positions[best]
+    end = positions[best + len(wanted) - 1] + 1
+    new_before = collapsed[:start].strip()[-CONTEXT_CHARS:].strip()
+    new_after = collapsed[end:].strip()[:CONTEXT_CHARS].strip()
+    return new_before, new_after
+
+
+def _page_visible_text(storage_tag: str, page_path: str) -> str | None:
+    trimmed = page_path.strip("/")
+    if not trimmed:
+        candidates = ["index.html"]
+    else:
+        candidates = [f"{trimmed}/index.html", trimmed if trimmed.lower().endswith(".html") else f"{trimmed}.html"]
+    for rel in candidates:
+        raw = SITE_STORE.read_file(storage_tag, rel)
+        if raw is None:
+            continue
+        parser = _VisibleTextParser()
+        parser.feed(raw.decode("utf-8", errors="replace"))
+        return "".join(parser.main_parts or parser.all_parts)
+    return None
+
+
+def _insert_comment_row(conn: DBConnectionProxy, values: dict[str, Any]) -> int:
+    columns = list(values.keys())
+    sql = f"INSERT INTO comments ({', '.join(columns)}) VALUES ({', '.join(['?'] * len(columns))})"
+    params = tuple(values[c] for c in columns)
+    if DB_BACKEND == "postgres":
+        inserted = conn.execute(f"{sql} RETURNING id", params).fetchone()
+        if not inserted:
+            raise ValueError("failed to copy comment")
+        return int(inserted["id"])
+    return int(conn.execute(sql, params).lastrowid)
+
+
+def carry_comments_forward(
+    conn: DBConnectionProxy,
+    previous_build: Any,
+    new_build_id: int,
+    new_storage_tag: str,
+) -> tuple[int, int]:
+    """Copy open preview comments from the previous version onto the new one when
+    the text they were attached to still appears on the same page, in the same
+    surroundings if the comment saved them (see _locate_selection).
+
+    Returns (carried, outdated). Comments that can't be matched stay on the
+    previous version and show up as outdated. Resolved comments stay where they
+    are, as do comments on the diff view, whose row keys don't exist in a new
+    version.
+    """
+    roots = conn.execute(
+        """
+        SELECT * FROM comments
+        WHERE build_id = ? AND parent_id IS NULL AND resolved = 0
+        ORDER BY id ASC
+        """,
+        (int(previous_build["id"]),),
+    ).fetchall()
+    page_text: dict[str, str | None] = {}
+    carried = 0
+    outdated = 0
+    for root in roots:
+        kind = str(root["kind"] or "preview") if "kind" in root.keys() else "preview"
+        selected = str(root["selected_text"] or "")
+        page_path = str(root["page_path"])
+        if kind != "preview" or not _normalize_for_match(selected):
+            outdated += 1
+            continue
+        if page_path not in page_text:
+            page_text[page_path] = _page_visible_text(new_storage_tag, page_path)
+        text = page_text[page_path]
+        located = None
+        if text is not None:
+            located = _locate_selection(
+                text,
+                selected,
+                root["context_before"] if "context_before" in root.keys() else None,
+                root["context_after"] if "context_after" in root.keys() else None,
+            )
+        if located is None:
+            outdated += 1
+            continue
+        # No selection or line numbers are copied. They describe the old page, so
+        # the widget finds the new position again from the selected text.
+        new_root_id = _insert_comment_row(
+            conn,
+            {
+                "build_id": new_build_id,
+                "page_path": page_path,
+                "line_start": None,
+                "line_end": None,
+                "selected_text": root["selected_text"],
+                "selection_json": None,
+                "body": root["body"],
+                "reviewer": root["reviewer"],
+                "parent_id": None,
+                "resolved": 0,
+                "created_at": root["created_at"],
+                "kind": "preview",
+                "edited_at": root["edited_at"] if "edited_at" in root.keys() else None,
+                "carried_from_id": int(root["id"]),
+                # The text around the highlight as it reads in the new version.
+                "context_before": located[0],
+                "context_after": located[1],
+            },
+        )
+        replies = conn.execute(
+            "SELECT * FROM comments WHERE parent_id = ? ORDER BY created_at ASC, id ASC",
+            (int(root["id"]),),
+        ).fetchall()
+        for reply in replies:
+            _insert_comment_row(
+                conn,
+                {
+                    "build_id": new_build_id,
+                    "page_path": page_path,
+                    "selected_text": reply["selected_text"] or "",
+                    "body": reply["body"],
+                    "reviewer": reply["reviewer"],
+                    "parent_id": new_root_id,
+                    "resolved": 0,
+                    "created_at": reply["created_at"],
+                    "kind": "preview",
+                    "edited_at": reply["edited_at"] if "edited_at" in reply.keys() else None,
+                },
+            )
+        carried += 1
+    return carried, outdated
+
+
+def count_outdated_comments(build: Any, page_path: str | None = None) -> int:
+    """Open comments on earlier versions of this review that were not carried
+    forward, optionally only those on one page. Only meaningful for the latest
+    version, otherwise returns 0."""
+    key = review_key_of(build)
+    version = version_of(build)
+    with db_connect() as conn:
+        latest_version = conn.execute(
+            "SELECT MAX(COALESCE(version, 1)) AS v FROM builds WHERE COALESCE(review_key, tag) = ?",
+            (key,),
+        ).fetchone()
+        if not latest_version or int(latest_version["v"] or 1) != version:
+            return 0
+        page_clause = "AND c.page_path = ?" if page_path is not None else ""
+        params: tuple[Any, ...] = (key, version) + ((page_path,) if page_path is not None else ())
+        row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS n
+            FROM comments c
+            JOIN builds b ON b.id = c.build_id
+            LEFT JOIN comments d ON d.carried_from_id = c.id
+            WHERE COALESCE(b.review_key, b.tag) = ?
+              AND COALESCE(b.version, 1) < ?
+              AND c.parent_id IS NULL
+              AND c.resolved = 0
+              AND d.id IS NULL
+              {page_clause}
+            """,
+            params,
+        ).fetchone()
+    return int(row["n"] or 0) if row else 0
+
+
 def get_build_by_tag(tag: str) -> sqlite3.Row | None:
     with db_connect() as conn:
         return conn.execute("SELECT * FROM builds WHERE tag = ?", (tag,)).fetchone()
@@ -1046,9 +1504,12 @@ def list_builds() -> list[sqlite3.Row]:
             SELECT
                 b.*,
                 SUM(CASE WHEN c.id IS NOT NULL AND c.parent_id IS NULL THEN 1 ELSE 0 END) AS comment_count,
-                SUM(CASE WHEN c.id IS NOT NULL AND c.parent_id IS NULL AND c.resolved = 0 THEN 1 ELSE 0 END) AS open_comment_count
+                SUM(CASE WHEN c.id IS NOT NULL AND c.parent_id IS NULL AND c.resolved = 0 THEN 1 ELSE 0 END) AS open_comment_count,
+                SUM(CASE WHEN c.id IS NOT NULL AND c.parent_id IS NULL AND d.id IS NULL THEN 1 ELSE 0 END) AS current_comment_count,
+                SUM(CASE WHEN c.id IS NOT NULL AND c.parent_id IS NULL AND c.resolved = 0 AND d.id IS NULL THEN 1 ELSE 0 END) AS current_open_comment_count
             FROM builds b
             LEFT JOIN comments c ON c.build_id = b.id
+            LEFT JOIN comments d ON d.carried_from_id = c.id
             GROUP BY b.id
             ORDER BY CASE WHEN b.archived_at IS NULL THEN 0 ELSE 1 END ASC,
                      COALESCE(b.updated_at, b.created_at) DESC,
@@ -1057,19 +1518,51 @@ def list_builds() -> list[sqlite3.Row]:
         ).fetchall()
 
 
+def list_reviews() -> list[dict[str, Any]]:
+    """One entry per review, newest activity first. Each has the latest version's
+    row, every version's row, and comment totals across all versions.
+
+    Totals across versions skip a comment that was carried forward, since its
+    copy on the newer version already stands in for it.
+    """
+    rows = list_builds()
+    grouped: dict[str, list[Any]] = {}
+    order: list[str] = []
+    for row in rows:
+        key = review_key_of(row)
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(row)
+    reviews: list[dict[str, Any]] = []
+    for key in order:
+        versions = sorted(grouped[key], key=lambda r: (version_of(r), int(r["id"])))
+        reviews.append(
+            {
+                "key": key,
+                "latest": versions[-1],
+                "versions": versions,
+                "total_comment_count": sum(int(r["current_comment_count"] or 0) for r in versions),
+                "total_open_comment_count": sum(int(r["current_open_comment_count"] or 0) for r in versions),
+            }
+        )
+    return reviews
+
+
 def mark_build_archived(build_id: int) -> bool:
     with db_connect() as conn:
-        row = conn.execute("SELECT id, archived_at FROM builds WHERE id = ?", (build_id,)).fetchone()
+        row = conn.execute("SELECT id, tag, review_key FROM builds WHERE id = ?", (build_id,)).fetchone()
         if not row:
             return False
         now = now_ts()
+        # Deleting a review schedules every one of its versions.
         conn.execute(
             """
             UPDATE builds
             SET archived_at = COALESCE(archived_at, ?), updated_at = ?
-            WHERE id = ?
+            WHERE COALESCE(review_key, tag) = ?
             """,
-            (now, now, build_id),
+            (now, now, review_key_of(row)),
         )
         conn.commit()
     return True
@@ -1077,22 +1570,22 @@ def mark_build_archived(build_id: int) -> bool:
 
 def restore_archived_build(build_id: int) -> bool:
     with db_connect() as conn:
-        row = conn.execute("SELECT id FROM builds WHERE id = ?", (build_id,)).fetchone()
+        row = conn.execute("SELECT id, tag, review_key FROM builds WHERE id = ?", (build_id,)).fetchone()
         if not row:
             return False
         conn.execute(
             """
             UPDATE builds
             SET archived_at = NULL, updated_at = ?
-            WHERE id = ?
+            WHERE COALESCE(review_key, tag) = ?
             """,
-            (now_ts(), build_id),
+            (now_ts(), review_key_of(row)),
         )
         conn.commit()
     return True
 
 
-def delete_build_and_comments(build_id: int) -> bool:
+def delete_build_and_comments(build_id: int, delete_storage: bool = True) -> bool:
     with db_connect() as conn:
         row = conn.execute("SELECT tag FROM builds WHERE id = ?", (build_id,)).fetchone()
         if not row:
@@ -1102,11 +1595,30 @@ def delete_build_and_comments(build_id: int) -> bool:
         conn.execute("DELETE FROM page_diffs WHERE build_id = ?", (build_id,))
         conn.execute("DELETE FROM builds WHERE id = ?", (build_id,))
         conn.commit()
-    try:
-        SITE_STORE.delete_build(tag)
-    except Exception:
-        # The preview metadata is already removed; best-effort cleanup of storage is sufficient.
-        pass
+    if delete_storage:
+        try:
+            SITE_STORE.delete_build(tag)
+        except Exception:
+            # The preview metadata is already removed; best-effort cleanup of storage is sufficient.
+            pass
+    return True
+
+
+def delete_review(build_id: int) -> bool:
+    """Permanently delete every version of the review this build belongs to."""
+    with db_connect() as conn:
+        row = conn.execute("SELECT id, tag, review_key FROM builds WHERE id = ?", (build_id,)).fetchone()
+        if not row:
+            return False
+        ids = [
+            int(r["id"])
+            for r in conn.execute(
+                "SELECT id FROM builds WHERE COALESCE(review_key, tag) = ?",
+                (review_key_of(row),),
+            ).fetchall()
+        ]
+    for version_build_id in ids:
+        delete_build_and_comments(version_build_id)
     return True
 
 
@@ -1199,17 +1711,37 @@ def fetch_feedback(filters: dict[str, Any], sort_key: str = "created_at", sort_d
 
     build_id = filters.get("build_id")
     if build_id:
-        clauses.append("c.build_id = ?")
+        # Any version's id selects the whole review, the version filter narrows it.
+        clauses.append(
+            "COALESCE(b.review_key, b.tag) = "
+            "(SELECT COALESCE(rk.review_key, rk.tag) FROM builds rk WHERE rk.id = ?)"
+        )
         params.append(build_id)
+    version = filters.get("version", "latest")
+    if version == "all":
+        # A comment that was carried forward is represented by its copy, so skip the original.
+        clauses.append("d.id IS NULL")
+    elif isinstance(version, int):
+        clauses.append("COALESCE(b.version, 1) = ?")
+        params.append(version)
+    else:
+        clauses.append(f"COALESCE(b.version, 1) = {_LATEST_VERSION_SQL}")
     reviewer = filters.get("reviewer")
     if reviewer:
         clauses.append("LOWER(c.reviewer) LIKE LOWER(?)")
         params.append(f"%{reviewer}%")
-    resolved = filters.get("resolved")
-    if resolved == "resolved":
-        clauses.append("c.resolved = 1")
-    elif resolved == "unresolved":
-        clauses.append("c.resolved = 0")
+    # Open and resolved say whether the comment has been dealt with. Outdated is separate:
+    # the comment sits on an earlier version and has no copy on a newer one, whether it is
+    # open or resolved. Picking several statuses shows comments matching any of them.
+    outdated_sql = f"(d.id IS NULL AND COALESCE(b.version, 1) < {_LATEST_VERSION_SQL})"
+    status_sql = {
+        "open": "c.resolved = 0",
+        "outdated": outdated_sql,
+        "resolved": "c.resolved = 1",
+    }
+    statuses = [name for name in (filters.get("statuses") or []) if name in status_sql]
+    if statuses and len(set(statuses)) < len(status_sql):
+        clauses.append("(" + " OR ".join(status_sql[name] for name in dict.fromkeys(statuses)) + ")")
     from_ts = filters.get("from_ts")
     if from_ts is not None:
         clauses.append("c.created_at >= ?")
@@ -1222,6 +1754,7 @@ def fetch_feedback(filters: dict[str, Any], sort_key: str = "created_at", sort_d
     sort_columns = {
         "preview": "b.display_name",
         "publication": "b.display_name",
+        "version": "COALESCE(b.version, 1)",
         "page_path": "c.page_path",
         "reviewer": "c.reviewer",
         "created_at": "c.created_at",
@@ -1233,11 +1766,18 @@ def fetch_feedback(filters: dict[str, Any], sort_key: str = "created_at", sort_d
     query = f"""
         SELECT
             c.*,
-            b.tag AS build_tag,
+            COALESCE(b.review_key, b.tag) AS build_tag,
             b.display_name AS build_name,
-            b.archived_at AS build_archived_at
+            b.archived_at AS build_archived_at,
+            COALESCE(b.version, 1) AS build_version,
+            {_LATEST_VERSION_SQL} AS latest_version,
+            ob.version AS carried_from_version,
+            d.id AS carried_to_id
         FROM comments c
         JOIN builds b ON b.id = c.build_id
+        LEFT JOIN comments d ON d.carried_from_id = c.id
+        LEFT JOIN comments o ON o.id = c.carried_from_id
+        LEFT JOIN builds ob ON ob.id = o.build_id
         WHERE {' AND '.join(clauses)}
         ORDER BY {order_column} {order_dir}, c.id DESC
     """
@@ -1250,6 +1790,12 @@ def fetch_feedback(filters: dict[str, Any], sort_key: str = "created_at", sort_d
 
     for comment in comments:
         comment["replies"] = replies.get(comment["id"], [])
+        comment["is_latest_version"] = int(comment["build_version"]) == int(comment["latest_version"])
+        # On an earlier version with no copy on a newer one, so it isn't on the latest version.
+        comment["outdated"] = (
+            comment.get("carried_to_id") is None
+            and int(comment["build_version"]) < int(comment["latest_version"])
+        )
     return comments
 
 
@@ -1257,10 +1803,12 @@ def fetch_page_comments(build_id: int, page_path: str) -> list[dict[str, Any]]:
     with db_connect() as conn:
         roots = conn.execute(
             """
-            SELECT *
-            FROM comments
-            WHERE build_id = ? AND page_path = ? AND parent_id IS NULL
-            ORDER BY created_at DESC, id DESC
+            SELECT c.*, ob.version AS carried_from_version
+            FROM comments c
+            LEFT JOIN comments o ON o.id = c.carried_from_id
+            LEFT JOIN builds ob ON ob.id = o.build_id
+            WHERE c.build_id = ? AND c.page_path = ? AND c.parent_id IS NULL
+            ORDER BY c.created_at DESC, c.id DESC
             """,
             (build_id, page_path),
         ).fetchall()
@@ -1273,21 +1821,26 @@ def fetch_page_comments(build_id: int, page_path: str) -> list[dict[str, Any]]:
 
 def fetch_build_for_export(build_id: int) -> sqlite3.Row | None:
     with db_connect() as conn:
-        return conn.execute("SELECT id, tag, display_name FROM builds WHERE id = ?", (build_id,)).fetchone()
+        return conn.execute(
+            "SELECT id, tag, review_key, display_name FROM builds WHERE id = ?", (build_id,)
+        ).fetchone()
 
 
 def fetch_build_comments_for_export(build_id: int) -> list[dict[str, Any]]:
+    """Every comment on every version of the review this build belongs to."""
     with db_connect() as conn:
         rows = conn.execute(
             """
             SELECT
                 c.*,
-                b.tag AS build_tag,
-                b.display_name AS build_name
+                COALESCE(b.review_key, b.tag) AS build_tag,
+                b.display_name AS build_name,
+                COALESCE(b.version, 1) AS build_version
             FROM comments c
             JOIN builds b ON b.id = c.build_id
-            WHERE c.build_id = ?
-            ORDER BY c.created_at ASC, c.id ASC
+            WHERE COALESCE(b.review_key, b.tag) =
+                  (SELECT COALESCE(rk.review_key, rk.tag) FROM builds rk WHERE rk.id = ?)
+            ORDER BY COALESCE(b.version, 1) ASC, c.created_at ASC, c.id ASC
             """,
             (build_id,),
         ).fetchall()
@@ -1307,6 +1860,8 @@ def create_comment(
     kind: str = "preview",
     diff_start_key: str | None = None,
     diff_end_key: str | None = None,
+    context_before: str | None = None,
+    context_after: str | None = None,
 ) -> int:
     if kind not in ("preview", "diff"):
         raise ValueError("kind must be 'preview' or 'diff'")
@@ -1326,12 +1881,24 @@ def create_comment(
                     selection = json.loads(str(parent_selection_raw))
                 except Exception:
                     selection = None
-        build = conn.execute("SELECT id, archived_at FROM builds WHERE id = ?", (build_id,)).fetchone()
+        build = conn.execute(
+            "SELECT id, tag, review_key, version, archived_at FROM builds WHERE id = ?", (build_id,)
+        ).fetchone()
         if not build:
             raise ValueError("preview not found")
         build_archived_at = build["archived_at"] if "archived_at" in build.keys() else None
         if build_archived_at is not None:
             raise ValueError("preview is scheduled for deletion and is read-only")
+        if parent_id is None:
+            latest_version = conn.execute(
+                "SELECT MAX(COALESCE(version, 1)) AS v FROM builds WHERE COALESCE(review_key, tag) = ?",
+                (review_key_of(build),),
+            ).fetchone()
+            if latest_version and version_of(build) < int(latest_version["v"] or 1):
+                raise ValueError(
+                    "this is an older version, so new comments can't be added. "
+                    "Reply to an existing comment or comment on the latest version"
+                )
         selection_json = json.dumps(selection, separators=(",", ":")) if selection else None
         values = (
             build_id,
@@ -1346,6 +1913,8 @@ def create_comment(
             kind,
             diff_start_key,
             diff_end_key,
+            clean_context(context_before),
+            clean_context(context_after),
             now_ts(),
         )
         if DB_BACKEND == "postgres":
@@ -1353,8 +1922,8 @@ def create_comment(
                 """
                 INSERT INTO comments (
                     build_id, page_path, line_start, line_end, selected_text, selection_json, body, reviewer,
-                    parent_id, kind, diff_start_key, diff_end_key, resolved, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                    parent_id, kind, diff_start_key, diff_end_key, context_before, context_after, resolved, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
                 RETURNING id
                 """,
                 values,
@@ -1367,8 +1936,8 @@ def create_comment(
                 """
                 INSERT INTO comments (
                     build_id, page_path, line_start, line_end, selected_text, selection_json, body, reviewer,
-                    parent_id, kind, diff_start_key, diff_end_key, resolved, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                    parent_id, kind, diff_start_key, diff_end_key, context_before, context_after, resolved, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
                 """,
                 values,
             )

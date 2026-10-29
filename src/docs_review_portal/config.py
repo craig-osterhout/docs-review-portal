@@ -40,7 +40,11 @@ DEFAULT_REVIEWER = os.environ.get("REVIEW_DEFAULT_REVIEWER", "anonymous")
 DEFAULT_REWRITE_HOST = "docs.docker.com"
 DISABLE_REWRITE_HOST_VALUES = {"0", "false", "no", "off", "none", "disable", "disabled"}
 PREVIEW_CONTEXT_COOKIE = "review_preview_tag"
+PREVIEW_VERSION_COOKIE = "review_preview_version"
 SOFT_DELETE_GRACE_SECONDS = 7 * 24 * 60 * 60
+# How long saved logs are kept before being deleted.
+LOG_RETENTION_DAYS = int(os.environ.get("REVIEW_LOG_RETENTION_DAYS", "30"))
+LOG_RETENTION_SECONDS = LOG_RETENTION_DAYS * 24 * 60 * 60
 RESERVED_ROOT_SEGMENTS = {
     "_review",
     "api",

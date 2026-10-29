@@ -84,7 +84,7 @@ def _parse_github_ts(value: str | None) -> int:
 def _poll_repo(repo: str, token: str, rewrite_host: str) -> None:
     from docs_review_portal import import_status
     from docs_review_portal.config import DEFAULT_REWRITE_HOST
-    from docs_review_portal.data import get_build_by_tag, import_build_archive_path
+    from docs_review_portal.data import get_latest_build_for_key, import_build_archive_path
     from docs_review_portal.helpers import slugify_tag
 
     resolved_rewrite_host = rewrite_host or DEFAULT_REWRITE_HOST
@@ -135,7 +135,7 @@ def _poll_repo(repo: str, token: str, rewrite_host: str) -> None:
             continue
 
         artifact_ts = _parse_github_ts(artifact_info.get("updated_at") or artifact_info.get("created_at"))
-        existing = get_build_by_tag(tag)
+        existing = get_latest_build_for_key(tag)
         if existing is not None:
             existing_ts = int(existing["updated_at"] or existing["created_at"] or 0)
             if artifact_ts <= existing_ts:
@@ -186,6 +186,9 @@ def _poll_repo(repo: str, token: str, rewrite_host: str) -> None:
                     source_ref=_sha,
                     rewrite_host=_rh,
                     stage_callback=lambda stage: import_status.update(_tag, stage),
+                    # A PR preview is refreshed on every push, so overwrite it in place
+                    # rather than adding a version per commit.
+                    new_version=False,
                 )
                 _log.info("github_poller: import complete for %s (build_id=%d)", _tag, result.build_id)
                 import_status.complete(_tag)

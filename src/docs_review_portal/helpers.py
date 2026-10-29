@@ -147,7 +147,15 @@ def rewrite_docs_domain_urls(
     return content
 
 
-def inject_review_bundle_html(content: str, build_id: int, tag: str, page_path: str, changed_pages: list[str] | None = None, has_diff: bool = False) -> str:
+def inject_review_bundle_html(
+    content: str,
+    build_id: int,
+    tag: str,
+    page_path: str,
+    changed_pages: list[str] | None = None,
+    has_diff: bool = False,
+    review: dict | None = None,
+) -> str:
     context = {
         "buildId": build_id,
         "buildTag": tag,
@@ -155,6 +163,10 @@ def inject_review_bundle_html(content: str, build_id: int, tag: str, page_path: 
         "changedPages": changed_pages or [],
         "hasDiff": has_diff,
     }
+    if review:
+        # Version details for reviews that have more than one version: the review
+        # key, which version this page belongs to, and the URL prefix to stay inside it.
+        context.update(review)
     inject = (
         f"{INJECT_START}\n"
         '<link rel="stylesheet" href="/_review/assets/review.css">\n'
@@ -177,6 +189,26 @@ def build_path(tag: str, path: str = "/") -> str:
     return f"/{safe_tag}{suffix}"
 
 
+def review_path(key: str, version: int | None = None, is_latest: bool = True, path: str = "/") -> str:
+    """URL path for a page of a review. The latest version lives at /<key>/ and
+    older versions live under /<key>/_v/<n>/ so links keep working after new uploads."""
+    safe_key = slugify_tag(key)
+    suffix = path if path.startswith("/") else f"/{path}"
+    base = f"/{safe_key}" if is_latest or not version else f"/{safe_key}/_v/{int(version)}"
+    return f"{base}/" if suffix == "/" else f"{base}{suffix}"
+
+
+def review_url(
+    key: str,
+    version: int | None = None,
+    is_latest: bool = True,
+    path: str = "/",
+    base: str | None = None,
+) -> str:
+    root = base.rstrip("/") if base else f"http://localhost:{PUBLIC_PORT}"
+    return f"{root}{review_path(key, version, is_latest, path)}"
+
+
 def build_host(tag: str) -> str:
     return f"localhost:{PUBLIC_PORT}{build_path(tag)}"
 
@@ -195,7 +227,7 @@ def html_page(title: str, body: str, auto_refresh: int | None = None, embed: boo
     <nav class="nav">
       <a href="/previews">Previews</a>
       <a href="/comments">Comments</a>
-      <a href="/logs">Logs</a>
+      <a href="/logs">System logs</a>
     </nav>
   </header>
   """
