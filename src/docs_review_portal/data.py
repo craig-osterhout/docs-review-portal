@@ -39,6 +39,16 @@ from docs_review_portal.helpers import (
     rewrite_docs_domain_urls,
     slugify_tag,
 )
+def _without_nul(value: Any) -> Any:
+    """PostgreSQL text can't hold NUL (0x00) characters and rejects the whole statement
+    if one turns up, for example in a diff of a file with a stray NUL in it. They are
+    replaced with the Unicode replacement character, so a reader can see something was
+    there and the text keeps its length and line breaks."""
+    if isinstance(value, str) and "\x00" in value:
+        return value.replace("\x00", "\ufffd")
+    return value
+
+
 class DBConnectionProxy:
     def __init__(self, conn: Any) -> None:
         self._conn = conn
@@ -49,7 +59,9 @@ class DBConnectionProxy:
         return statement
 
     def execute(self, statement: str, params: tuple[Any, ...] | list[Any] = ()) -> Any:
-        return self._conn.execute(self._prepare_sql(statement), params)
+        # Applied on every backend so SQLite behaves like PostgreSQL does.
+        clean = tuple(_without_nul(p) for p in params) if params else params
+        return self._conn.execute(self._prepare_sql(statement), clean)
 
     def executescript(self, script: str) -> None:
         if DB_BACKEND == "sqlite":
@@ -900,6 +912,62 @@ def store_page_diffs(conn: DBConnectionProxy, build_id: int, page_diffs_map: dic
         )
 
 
+def save_page_diffs_best_effort(build_id: int, page_diffs_map: dict[str, str], name: str) -> None:
+    """Save a preview's page diffs without ever failing the upload.
+
+    The diffs only feed the changed pages view, so a problem with one should cost that
+    page its diff and nothing more. All of them are tried in one go first, and if that
+    fails they are retried one page at a time to find the ones that can't be saved.
+    Pages whose diff was lost are taken off the build's list of pages with a diff, so
+    the view doesn't offer a diff that isn't there. Problems are logged as warnings.
+    """
+    log = _logging.getLogger(__name__)
+    try:
+        # With no diffs this just clears any old ones, as an overwritten preview needs.
+        with db_connect() as conn:
+            store_page_diffs(conn, build_id, page_diffs_map)
+            conn.commit()
+        return
+    except Exception as exc:
+        log.warning("%r: saving page diffs together failed (%s), retrying one page at a time", name, exc)
+
+    saved: list[str] = []
+    failed: list[str] = []
+    try:
+        with db_connect() as conn:
+            conn.execute("DELETE FROM page_diffs WHERE build_id = ?", (build_id,))
+            conn.commit()
+            for page_path, diff_content in page_diffs_map.items():
+                try:
+                    conn.execute(
+                        "INSERT INTO page_diffs (build_id, page_path, diff_content) VALUES (?, ?, ?)",
+                        (build_id, page_path, diff_content),
+                    )
+                    conn.commit()
+                    saved.append(page_path)
+                except Exception as exc:
+                    conn.rollback()
+                    failed.append(page_path)
+                    log.warning("%r: diff for %s could not be saved (%s)", name, page_path, exc)
+    except Exception as exc:
+        # Not even a connection. Treat it as no diffs, the preview itself is already saved.
+        log.warning("%r: page diffs could not be saved at all (%s)", name, exc)
+        saved, failed = [], list(page_diffs_map)
+
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                "UPDATE builds SET diff_pages = ? WHERE id = ?",
+                ("\n".join(sorted(saved)) or None, build_id),
+            )
+            conn.commit()
+    except Exception as exc:
+        log.warning("%r: could not update the list of pages with a diff (%s)", name, exc)
+    log.warning(
+        "%r: preview imported, but %d of %d page diff(s) could not be saved", name, len(failed), len(page_diffs_map)
+    )
+
+
 def fetch_page_diff(build_id: int, page_path: str) -> str | None:
     with db_connect() as conn:
         row = conn.execute(
@@ -1005,7 +1073,6 @@ def import_build_archive_path(
             else:
                 cur = conn.execute(insert_sql, values)
                 build_id = int(cur.lastrowid)
-        store_page_diffs(conn, build_id, page_diffs_map)
         if latest is not None and not overwrite:
             if stage_callback:
                 stage_callback("Carrying comments forward")
@@ -1014,6 +1081,11 @@ def import_build_archive_path(
                 "%r v%d: carried %d comment(s) forward, %d left outdated", review_key, version, carried, outdated
             )
         conn.commit()
+
+    # The preview exists now. The diffs come after it and can't fail the import.
+    if stage_callback:
+        stage_callback("Saving page diffs")
+    save_page_diffs_best_effort(build_id, page_diffs_map, review_key)
 
     return ImportedBuild(
         build_id=build_id,
@@ -1797,6 +1869,44 @@ def fetch_feedback(filters: dict[str, Any], sort_key: str = "created_at", sort_d
             and int(comment["build_version"]) < int(comment["latest_version"])
         )
     return comments
+
+
+def fetch_comment(comment_id: int) -> dict[str, Any] | None:
+    """One comment, or reply, with the details of the preview it belongs to. A comment
+    that starts a thread comes with its replies."""
+    with db_connect() as conn:
+        row = conn.execute(
+            f"""
+            SELECT
+                c.*,
+                COALESCE(b.review_key, b.tag) AS build_tag,
+                b.display_name AS build_name,
+                b.archived_at AS build_archived_at,
+                COALESCE(b.version, 1) AS build_version,
+                {_LATEST_VERSION_SQL} AS latest_version,
+                ob.version AS carried_from_version,
+                d.id AS carried_to_id
+            FROM comments c
+            JOIN builds b ON b.id = c.build_id
+            LEFT JOIN comments d ON d.carried_from_id = c.id
+            LEFT JOIN comments o ON o.id = c.carried_from_id
+            LEFT JOIN builds ob ON ob.id = o.build_id
+            WHERE c.id = ?
+            """,
+            (comment_id,),
+        ).fetchone()
+        if not row:
+            return None
+        item = row_to_comment_dict(row)
+        is_root = item.get("parent_id") is None
+        item["replies"] = fetch_replies(conn, [comment_id]).get(comment_id, []) if is_root else []
+    item["is_latest_version"] = int(item["build_version"]) == int(item["latest_version"])
+    item["outdated"] = (
+        is_root
+        and item.get("carried_to_id") is None
+        and int(item["build_version"]) < int(item["latest_version"])
+    )
+    return item
 
 
 def fetch_page_comments(build_id: int, page_path: str) -> list[dict[str, Any]]:

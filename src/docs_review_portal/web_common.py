@@ -45,6 +45,10 @@ class ReviewCommonMixin:
         self._send_html(HTTPStatus.INTERNAL_SERVER_ERROR, body)
 
     def _send_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+        # Every JSON response says whether it worked. Keys that were already there, such
+        # as "status" and "error", stay as they were so existing scripts keep working.
+        if isinstance(payload, dict) and "ok" not in payload:
+            payload = {"ok": int(status) < 400, **payload}
         data = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")

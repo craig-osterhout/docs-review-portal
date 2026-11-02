@@ -504,61 +504,6 @@ tr.is-archived .status.archived {
   min-width: 140px;
 }
 
-/* Upload dialog */
-dialog {
-  border: 1px solid #d9e2ef;
-  border-radius: 12px;
-  padding: 24px;
-  max-width: 600px;
-  width: calc(100vw - 40px);
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
-}
-
-dialog::backdrop {
-  background: rgba(10, 19, 32, 0.45);
-}
-
-.dialog-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 18px;
-}
-
-.dialog-header h2 {
-  margin: 0;
-  font-size: 1.1rem;
-}
-
-.dialog-close {
-  width: 32px;
-  height: 32px;
-  padding: 0;
-  border: 1px solid #bfccd9;
-  border-radius: 8px;
-  background: #fff;
-  color: #17324d;
-  font-size: 1.1rem;
-  line-height: 1;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-}
-
-.dialog-close:hover {
-  border-color: #7ea9e8;
-  background: #eef4ff;
-  color: #0b5fd3;
-}
-
-.dialog-rule {
-  border: none;
-  border-top: 1px solid #e6edf5;
-  margin: 14px 0 0;
-}
-
 /* Code snippet block inside details */
 .code-hint {
   background: #f4f7fb;
@@ -934,4 +879,113 @@ blockquote {
   display: flex;
   gap: 16px;
   margin: 14px 0 0;
+}
+
+/* Help page */
+.help-layout {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+
+.help-toc {
+  position: sticky;
+  /* Sits below the top navigation bar, which stays in view as the page scrolls. */
+  top: 64px;
+  font-size: 0.9rem;
+}
+
+.help-toc ul {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.help-toc a {
+  display: block;
+  padding: 5px 8px;
+  border-radius: 6px;
+  color: #17324d;
+  text-decoration: none;
+}
+
+.help-toc a:hover,
+.help-toc a.is-current {
+  background: #eef4ff;
+  color: #0b5fd3;
+}
+
+.help-content {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.help-section {
+  scroll-margin-top: 64px;
+}
+
+.help-section h2 {
+  margin-top: 0;
+}
+
+.help-section h3 {
+  margin: 20px 0 6px;
+  font-size: 1rem;
+}
+
+.help-section ul,
+.help-section ol {
+  padding-left: 22px;
+}
+
+.help-section li {
+  margin: 4px 0;
+}
+
+.help-table {
+  overflow-x: auto;
+  margin: 10px 0;
+}
+
+.help-code {
+  position: relative;
+}
+
+.help-code .code-hint {
+  padding-right: 70px;
+}
+
+.help-copy {
+  position: absolute;
+  top: 12px;
+  right: 8px;
+  padding: 3px 9px;
+  font-size: 0.75rem;
+  border: 1px solid #bfccd9;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #17324d;
+  cursor: pointer;
+}
+
+.help-copy:hover {
+  border-color: #7ea9e8;
+  background: #eef4ff;
+  color: #0b5fd3;
+}
+
+@media (max-width: 860px) {
+  .help-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .help-toc {
+    position: static;
+  }
 }

@@ -218,27 +218,8 @@ class ReviewPagesMixin:
         body = f"""
         <section class="panel" style="display:flex;align-items:center;justify-content:space-between;gap:12px">
           <h1 style="margin:0">Previews</h1>
-          <button type="button" id="open-upload-dialog">Upload preview</button>
+          <a class="button-link" href="/help#upload">Upload preview</a>
         </section>
-        <dialog id="upload-dialog" aria-labelledby="upload-dialog-title">
-          <div class="dialog-header">
-            <h2 id="upload-dialog-title">Upload preview</h2>
-            <button type="button" class="dialog-close" id="close-upload-dialog" aria-label="Close">&times;</button>
-          </div>
-          <p class="subtle" style="margin:0 0 4px">This script will build, package and upload the docs site for you. Replace <code>&lt;name&gt;</code> with the name of the preview (the branch name works well) and replace <code>/path/to/local/docs</code> with the path to your local docs repo:</p>
-          <pre class="code-hint">REVIEW_SERVICE_URL={html.escape(self._public_base())} \\
-  bash &lt;(curl -fsSL https://raw.githubusercontent.com/craig-osterhout/docs-review-portal/refs/heads/main/scripts/publish-branch.sh) &lt;name&gt; \\
-  --docs-path /path/to/local/docs</pre>
-          <p class="subtle" style="margin:12px 0 0">Running it again with the same name uploads a new version of that preview. Reviewers see the latest version by default and can switch to older versions, which keep their comments. Open comments are carried forward when their text is still on the page.</p>
-        </dialog>
-        <script>
-          (function () {{
-            var dialog = document.getElementById('upload-dialog');
-            document.getElementById('open-upload-dialog').addEventListener('click', function () {{ dialog.showModal(); }});
-            document.getElementById('close-upload-dialog').addEventListener('click', function () {{ dialog.close(); }});
-            dialog.addEventListener('click', function (e) {{ if (e.target === dialog) dialog.close(); }});
-          }})();
-        </script>
         <script>
           document.addEventListener('click', function (e) {{
             document.querySelectorAll('details.version-menu[open]').forEach(function (d) {{
@@ -266,7 +247,7 @@ class ReviewPagesMixin:
         self._send_html(HTTPStatus.OK, html_page("Previews", body, auto_refresh=auto_refresh))
 
     def _export_preview_comments_csv(self, path: str) -> None:
-        match = re.match(r"^/(?:publications|previews)/(\d+)/comments\.csv$", path)
+        match = re.match(r"^/(?:publications|previews|api/builds)/(\d+)/comments\.csv$", path)
         if not match:
             self.send_error(HTTPStatus.NOT_FOUND, "Export route not found")
             return

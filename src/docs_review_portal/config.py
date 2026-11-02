@@ -55,6 +55,8 @@ RESERVED_ROOT_SEGMENTS = {
     "publications",
     "feedback",
     "builds",
+    "logs",
+    "help",
 }
 
 # GitHub Actions polling integration

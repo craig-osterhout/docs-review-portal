@@ -228,6 +228,7 @@ def html_page(title: str, body: str, auto_refresh: int | None = None, embed: boo
       <a href="/previews">Previews</a>
       <a href="/comments">Comments</a>
       <a href="/logs">System logs</a>
+      <a href="/help">Help</a>
     </nav>
   </header>
   """

@@ -110,7 +110,7 @@ The **System logs** page (`/logs`) shows the app's logs, saved in the database s
 
 ## Upload a preview
 
-The **Upload preview** button on the `/previews` page shows the publish script command to copy. It builds, packages and uploads the docs site for you:
+The **Upload preview** button on the `/previews` page opens the upload section of the Help page, which has the publish script command to copy. It builds, packages and uploads the docs site for you:
 
 ```bash
 REVIEW_SERVICE_URL=https://<service-url> \
@@ -138,13 +138,15 @@ Existing previews become version 1 of their own preview, so nothing changes for 
 
 ## Changed pages
 
-Each preview can store a list of URLs that changed on the branch, so reviewers know where to focus.
+Each preview can store a list of URLs that changed on the branch, so reviewers know where to focus, and a diff for each of those pages.
 
-**Automatic** — when using `publish-branch.sh` or the Docker docs one-liner from the Upload dialog, a `.changed-pages` file is automatically generated from `git diff origin/main...HEAD -- content/` and bundled into the archive. Only works when run from a feature branch with content changes.
+**Automatic** — `publish-branch.sh` generates a `.changed-pages` file and a diff for each page, comparing against the point where the branch split off `origin/main`, and bundles them into the archive. It includes uncommitted and new files. If almost every page shows as changed, `origin/main` in that clone is probably stale or points at a fork.
 
-**Manual** — open the list icon in the **Actions** column for any preview (or go to `/previews/<id>/changed-pages`) to add, remove, or edit paths by hand.
+**Manual** — the list can be replaced with the API, `POST /api/builds/<id>/changed-pages`. The list icon in the **Actions** column (or `/previews/<id>/changed-pages`) opens the list and the diffs, but doesn't edit them.
 
-**In the review widget** — when a preview has changed pages, a list icon appears in the comment panel header. Clicking it expands the list above the comments so reviewers can navigate directly to changed pages.
+**In the review widget** — when a preview has changed pages, a diff icon appears in the comment panel header. It opens the changed pages as a tree with the diff for each page, where reviewers can also comment on the diff.
+
+The **Help** page in the portal covers all of this for reviewers and authors.
 
 ## Add a preview (API)
 
@@ -161,6 +163,7 @@ The response streams server-side progress lines and finishes with a `result:` JS
 - `name` (required) — preview name, normalized to a URL-safe slug
 - `rewrite_host` — hostname whose absolute URLs should be rewritten to relative paths (e.g. `docs.docker.com`); pass `off` or `none` to disable rewriting
 - `source_ref` — optional label stored as the build's image ref (e.g. a git SHA)
+- `mode` — `new_version` (the default) creates the next version when the name already exists, `overwrite` replaces the latest version in place and keeps its comments. For a chunked upload it is read from the last chunk's request
 
 **Chunked upload for large archives:**
 
@@ -188,16 +191,61 @@ Generated docs are available at `http://localhost:8080/<tag>/`.
 
 ## API reference
 
+- Requests and responses are JSON, apart from the upload, which streams plain text, and the CSV export.
+- Every JSON response has an `ok` field. Errors are `{"ok": false, "error": "message"}` with a 4xx status. Older fields such as `status` are kept so existing scripts keep working.
+- Times are unix seconds, with a `_human` copy where it helps.
+- There is no authentication.
+- Previews can't be deleted, scheduled for deletion or restored through the API. Those are actions for a person in the web UI.
+- A preview has an `id` for each version. A review is the name, such as `my-docs-review`, with all of its versions. Any version's id selects its review where a review is wanted.
+
+### Previews and reviews
+
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/builds` | List all builds with comment counts |
-| `POST` | `/api/builds/upload` | Upload a site archive (see above) |
-| `POST` | `/api/builds/<id>/changed-pages` | Replace the changed pages list for a preview — body: `{"pages": ["/path/", ...]}` |
-| `GET` | `/api/comments?build_id=<id>&page_path=<path>` | Fetch comments for a page |
-| `POST` | `/api/comments` | Create a comment |
-| `POST` | `/api/comments/<id>/resolve` | Resolve or unresolve a comment |
-| `POST` | `/api/comments/<id>/reply` | Reply to a comment |
-| `GET` | `/healthz` | Health check |
+| `GET` | `/api/builds` | Every preview, one entry per version, with comment counts, `review_key`, `version`, `is_latest` and `site_url` |
+| `GET` | `/api/builds/<id>` | One preview, with its `changed_pages` and `diff_pages`, and its review with every version and the comment totals across versions |
+| `GET` | `/api/reviews` | One entry per review, with its versions and comment totals |
+| `GET` | `/api/reviews/<name>` | One review by name |
+| `GET` | `/api/builds/<id>/changed-pages` | The pages listed as changed, and which of them have a stored diff |
+| `POST` | `/api/builds/<id>/changed-pages` | Replace the changed pages list. Body: `{"pages": ["/path/", ...]}` |
+| `GET` | `/api/builds/<id>/page-diff?page=<path>` | The stored diff for a page, as plain text |
+| `POST` | `/api/builds/upload` | Upload a site archive, see "Add a preview (API)" |
+| `GET` | `/api/imports` | Uploads in progress or recently failed, optionally for one `name`. Progress is held in memory by the instance doing the import, so with several instances this lists only the one that answered |
+
+### Comments
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/comments?build_id=<id>&page_path=<path>` | The comments on one page, with replies, as the in-page widget loads them |
+| `GET` | `/api/comments` | Comments across pages, with the filters below |
+| `GET` | `/api/comments/<id>` | One comment or reply. A comment that starts a thread includes its replies |
+| `POST` | `/api/comments` | Create a comment. Not allowed on an older version of a review, replies are |
+| `POST` | `/api/comments/<id>/reply` | Reply to a comment. Body: `{"reviewer": "...", "body": "..."}` |
+| `POST` | `/api/comments/<id>/resolve` | Resolve or unresolve. Body: `{"resolved": true}` |
+| `POST` | `/api/comments/<id>/edit` | Change the text. Body: `{"body": "..."}` |
+| `POST` | `/api/comments/<id>/delete` | Delete a comment and its replies |
+| `GET` | `/api/builds/<id>/comments.csv` | Every comment and reply on every version of the review, as CSV, with `version` and `carried_from_comment_id` columns |
+
+Filters for `GET /api/comments` without a `page_path`. All are optional.
+
+| Parameter | Meaning |
+|-----------|---------|
+| `build_id` or `review` | Limit to one review, by any version's id or by name. Leave both out for every review |
+| `version` | `latest` (the default), `all`, or a version number |
+| `status` | `open`, `outdated` or `resolved`. Repeat it to match any of them |
+| `reviewer` | Part of the reviewer's name |
+| `from`, `to` | Unix time, or a date such as `2026-10-01` or `2026-10-01T12:00` |
+| `sort`, `dir` | `preview`, `page_path`, `reviewer`, `created_at`, `resolved` or `version`, and `asc` or `desc` (the default) |
+| `limit`, `offset` | Up to 1000 per request, 200 by default. The response has `total` and `has_more` |
+
+A comment is open if it is unresolved, resolved if it is resolved, and outdated if it sits on an earlier version and has no copy on the latest one. A comment can be both open and outdated, or resolved and outdated.
+
+### System logs and health
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/logs` | Saved log entries, newest first. Filters: `level` (`all`, `warning`, `error`), `q` (text), `instance`, `limit` (up to 1000) and `page`. If the saved logs can't be read, the answer comes from this instance's memory and `source` says so |
+| `GET` | `/healthz` | `{"status": "ok", "version": "<app version>"}` |
 
 ## Soft-delete workflow
 

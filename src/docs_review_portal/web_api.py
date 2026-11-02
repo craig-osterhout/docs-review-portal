@@ -25,6 +25,7 @@ def _run_import(
     display_name: str,
     source_ref: str | None,
     rewrite_host: str,
+    new_version: bool = True,
 ) -> None:
     import_status.update(tag, "Starting import")
     _log.info("import started for %r (archive: %s, size: %d bytes)", tag, archive_path, archive_path.stat().st_size)
@@ -36,6 +37,7 @@ def _run_import(
             source_ref=source_ref,
             rewrite_host=rewrite_host,
             stage_callback=lambda stage: _stage_callback(tag, stage),
+            new_version=new_version,
         )
         _log.info("import complete for %r (build_id: %d)", tag, result.build_id)
         import_status.complete(tag)
@@ -55,12 +57,15 @@ from docs_review_portal.config import (
     DEFAULT_REVIEWER,
     DEFAULT_REWRITE_HOST,
     DISABLE_REWRITE_HOST_VALUES,
+    RESERVED_ROOT_SEGMENTS,
     normalize_rewrite_host,
 )
 from docs_review_portal.data import (
     count_outdated_comments,
     create_comment,
     delete_comment,
+    fetch_comment,
+    fetch_feedback,
     fetch_page_comments,
     fetch_page_diff,
     get_build_by_id,
@@ -68,6 +73,7 @@ from docs_review_portal.data import (
     get_latest_build_for_key,
     import_build_archive_path,
     list_builds,
+    list_reviews,
     review_key_of,
     normalize_selection_payload,
     set_comment_resolved,
@@ -79,6 +85,7 @@ from docs_review_portal.helpers import (
     canonical_page_path,
     compute_delete_at,
     format_ts,
+    parse_local_datetime_to_ts,
     review_url,
     slugify_tag,
 )
@@ -86,46 +93,195 @@ from docs_review_portal.helpers import (
 
 
 class ReviewApiMixin:
+    @staticmethod
+    def _lines(raw: object) -> list[str]:
+        return [ln.strip() for ln in str(raw).splitlines() if ln.strip()] if raw else []
+
+    def _build_json(self, row, latest_versions: dict[str, int], include_pages: bool = False) -> dict:
+        key = review_key_of(row)
+        version = int(row["version"] or 1)
+        item = {
+            "id": int(row["id"]),
+            "image_ref": row["image_ref"],
+            "tag": row["tag"],
+            "review_key": key,
+            "version": version,
+            "is_latest": version == latest_versions[key],
+            "display_name": row["display_name"],
+            "created_at": int(row["created_at"]),
+            "created_at_human": format_ts(int(row["created_at"])),
+            "updated_at": int(row["updated_at"] or row["created_at"]),
+            "updated_at_human": format_ts(int(row["updated_at"] or row["created_at"])),
+            "comment_count": int(row["comment_count"] or 0),
+            "open_comment_count": int(row["open_comment_count"] or 0),
+            "rewrite_host": get_build_rewrite_host(row) or None,
+            "archived_at": int(row["archived_at"]) if row["archived_at"] is not None else None,
+            "delete_after": (
+                compute_delete_at(int(row["archived_at"])) if row["archived_at"] is not None else None
+            ),
+            "site_url": review_url(key, version, version == latest_versions[key], base=self._public_base()),
+        }
+        if include_pages:
+            item["changed_pages"] = self._lines(row["changed_pages"])
+            item["diff_pages"] = self._lines(row["diff_pages"])
+        return item
+
+    def _review_json(self, review: dict, latest_versions: dict[str, int]) -> dict:
+        latest = review["latest"]
+        return {
+            "key": review["key"],
+            "display_name": latest["display_name"],
+            "latest_version": latest_versions[review["key"]],
+            "version_count": len(review["versions"]),
+            "total_comment_count": review["total_comment_count"],
+            "total_open_comment_count": review["total_open_comment_count"],
+            "versions": [self._build_json(v, latest_versions) for v in review["versions"]],
+        }
+
+    @staticmethod
+    def _latest_versions(reviews: list[dict]) -> dict[str, int]:
+        return {r["key"]: max(int(v["version"] or 1) for v in r["versions"]) for r in reviews}
+
     def _api_get_builds(self) -> None:
         rows = list_builds()
         latest_versions: dict[str, int] = {}
         for row in rows:
             key = review_key_of(row)
             latest_versions[key] = max(latest_versions.get(key, 0), int(row["version"] or 1))
-        payload = {
-            "builds": [
+        self._send_json(HTTPStatus.OK, {"builds": [self._build_json(row, latest_versions) for row in rows]})
+
+    def _api_get_build(self, path: str) -> None:
+        build_id = int(re.match(r"^/api/builds/(\d+)$", path).group(1))
+        reviews = list_reviews()
+        latest_versions = self._latest_versions(reviews)
+        for review in reviews:
+            for row in review["versions"]:
+                if int(row["id"]) == build_id:
+                    self._send_json(
+                        HTTPStatus.OK,
+                        {
+                            "build": self._build_json(row, latest_versions, include_pages=True),
+                            "review": self._review_json(review, latest_versions),
+                        },
+                    )
+                    return
+        self._send_json(HTTPStatus.NOT_FOUND, {"error": "Preview not found"})
+
+    def _api_get_reviews(self) -> None:
+        reviews = list_reviews()
+        latest_versions = self._latest_versions(reviews)
+        self._send_json(HTTPStatus.OK, {"reviews": [self._review_json(r, latest_versions) for r in reviews]})
+
+    def _api_get_review(self, path: str) -> None:
+        name = re.match(r"^/api/reviews/([^/]+)$", path).group(1)
+        reviews = list_reviews()
+        latest_versions = self._latest_versions(reviews)
+        for review in reviews:
+            if review["key"] == name:
+                self._send_json(HTTPStatus.OK, {"review": self._review_json(review, latest_versions)})
+                return
+        self._send_json(HTTPStatus.NOT_FOUND, {"error": "Review not found"})
+
+    def _api_get_changed_pages(self, path: str) -> None:
+        build_id = int(re.match(r"^/api/builds/(\d+)/changed-pages$", path).group(1))
+        row = get_build_by_id(build_id)
+        if not row:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Preview not found"})
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "build_id": build_id,
+                "review_key": review_key_of(row),
+                "version": int(row["version"] or 1),
+                "pages": self._lines(row["changed_pages"]),
+                "diff_pages": self._lines(row["diff_pages"]),
+            },
+        )
+
+    def _api_get_comment(self, path: str) -> None:
+        comment = fetch_comment(int(re.match(r"^/api/comments/(\d+)$", path).group(1)))
+        if comment is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Comment not found"})
+            return
+        self._send_json(HTTPStatus.OK, {"comment": comment})
+
+    def _api_get_logs(self, query: dict[str, list[str]]) -> None:
+        level = (query.get("level", ["all"])[0] or "all").lower()
+        if level not in ("all", "warning", "error"):
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "level must be all, warning or error"})
+            return
+        search = (query.get("q", [""])[0] or "").strip()
+        instance = (query.get("instance", [""])[0] or "").strip()
+        try:
+            limit = min(max(int(query.get("limit", ["200"])[0]), 1), 1000)
+            page = max(int(query.get("page", ["1"])[0]), 1)
+        except ValueError:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "limit and page must be numbers"})
+            return
+        source = "database"
+        instances: list[str] = []
+        has_older = False
+        try:
+            entries, has_older = log_buffer.query_entries(
+                level=level, search=search, instance=instance, limit=limit, offset=(page - 1) * limit
+            )
+            instances = log_buffer.list_instances()
+        except Exception:
+            # The saved logs can't be read, so answer from this instance's memory.
+            source = "memory"
+            entries = list(reversed(log_buffer.get_entries()))
+            if level != "all":
+                wanted = ("WARNING", "ERROR", "CRITICAL") if level == "warning" else ("ERROR", "CRITICAL")
+                entries = [e for e in entries if e["level"] in wanted]
+            if search:
+                needle = search.lower()
+                entries = [e for e in entries if needle in e["msg"].lower() or needle in e["logger"].lower()]
+            entries = entries[:limit]
+            page = 1
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "entries": [
+                    {
+                        "ts": e["ts"],
+                        "time": e["ts_human"],
+                        "level": e["level"],
+                        "logger": e["logger"],
+                        "message": e["msg"],
+                        "instance": e.get("instance") or "",
+                    }
+                    for e in entries
+                ],
+                "page": page,
+                "limit": limit,
+                "has_older": has_older,
+                "instances": instances,
+                "source": source,
+            },
+        )
+
+    def _api_get_imports(self, query: dict[str, list[str]]) -> None:
+        name = (query.get("name", [""])[0] or "").strip()
+        now = time.time()
+        items = []
+        for entry in import_status.get_all():
+            if name and name not in (entry["tag"], entry["display_name"]):
+                continue
+            items.append(
                 {
-                    "id": int(row["id"]),
-                    "image_ref": row["image_ref"],
-                    "tag": row["tag"],
-                    "review_key": review_key_of(row),
-                    "version": int(row["version"] or 1),
-                    "is_latest": int(row["version"] or 1) == latest_versions[review_key_of(row)],
-                    "display_name": row["display_name"],
-                    "created_at": int(row["created_at"]),
-                    "created_at_human": format_ts(int(row["created_at"])),
-                    "updated_at": int(row["updated_at"] or row["created_at"]),
-                    "updated_at_human": format_ts(int(row["updated_at"] or row["created_at"])),
-                    "comment_count": int(row["comment_count"] or 0),
-                    "open_comment_count": int(row["open_comment_count"] or 0),
-                    "rewrite_host": get_build_rewrite_host(row) or None,
-                    "archived_at": int(row["archived_at"]) if row["archived_at"] is not None else None,
-                    "delete_after": (
-                        compute_delete_at(int(row["archived_at"]))
-                        if row["archived_at"] is not None
-                        else None
-                    ),
-                    "site_url": review_url(
-                        review_key_of(row),
-                        int(row["version"] or 1),
-                        int(row["version"] or 1) == latest_versions[review_key_of(row)],
-                        base=self._public_base(),
-                    ),
+                    "name": entry["display_name"],
+                    "tag": entry["tag"],
+                    "stage": entry["stage"],
+                    "failed": bool(entry["failed"]),
+                    "error": entry["error"] or None,
+                    "started_at": int(entry["started_at"]),
+                    "elapsed_seconds": int(now - entry["started_at"]),
                 }
-                for row in rows
-            ]
-        }
-        self._send_json(HTTPStatus.OK, payload)
+            )
+        # Import progress is kept in memory by the instance that is doing the import, so with
+        # several instances running this only lists the ones on the instance that answered.
+        self._send_json(HTTPStatus.OK, {"imports": items, "instance": log_buffer.INSTANCE_ID})
 
     def _api_upload_build_archive(self, query: dict[str, list[str]]) -> None:
         name = (query.get("name", [""])[0] or "").strip()
@@ -139,6 +295,13 @@ class ReviewApiMixin:
             tag = slugify_tag(name)
         except ValueError as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        if tag.lower() in RESERVED_ROOT_SEGMENTS:
+            # These are pages of the portal itself, so a preview named like one would be unreachable.
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": f"{tag!r} is reserved for the portal itself, please choose another preview name"},
+            )
             return
         display_name = name
         rewrite_host_raw = (query.get("rewrite_host", [""])[0] or "").strip()
@@ -154,6 +317,13 @@ class ReviewApiMixin:
                     {"error": "rewrite_host must be a hostname, URL, or one of: off, none"},
                 )
                 return
+
+        # By default uploading to a name that exists creates its next version. "overwrite"
+        # replaces the latest version in place instead, keeping its comments.
+        mode = (query.get("mode", ["new_version"])[0] or "new_version").strip().lower()
+        if mode not in ("new_version", "overwrite"):
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "mode must be new_version or overwrite"})
+            return
 
         chunk_str = (query.get("chunk", [""])[0] or "").strip()
         chunks_str = (query.get("chunks", [""])[0] or "").strip()
@@ -232,7 +402,7 @@ class ReviewApiMixin:
         # allocates full CPU for the duration.
         t = threading.Thread(
             target=_run_import,
-            args=(archive_path, staging_dir, tag, display_name, source_ref, rewrite_host),
+            args=(archive_path, staging_dir, tag, display_name, source_ref, rewrite_host, mode != "overwrite"),
             daemon=True,
         )
         t.start()
@@ -257,13 +427,99 @@ class ReviewApiMixin:
                 "tag": tag,
                 "name": display_name,
                 "version": int(imported["version"] or 1) if imported else 1,
+                "mode": mode,
                 "rewrite_host": rewrite_host or None,
                 "site_url": build_url(tag, base=self._public_base()),
             })
             self._write_chunk(f"result: {result}\n".encode())
         self._write_chunk(b"")
 
+    def _api_list_comments(self, query: dict[str, list[str]]) -> None:
+        """Comments across pages, filtered the way the comments page does it."""
+        filters: dict = {}
+        build_raw = (query.get("build_id", [""])[0] or "").strip()
+        review = (query.get("review", [""])[0] or "").strip()
+        if build_raw:
+            if not build_raw.isdigit():
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "build_id must be a number"})
+                return
+            filters["build_id"] = int(build_raw)
+        if review:
+            latest = get_latest_build_for_key(review)
+            if latest is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Review not found"})
+                return
+            filters["build_id"] = int(latest["id"])
+
+        version = (query.get("version", ["latest"])[0] or "latest").strip().lower()
+        if version.isdigit():
+            filters["version"] = int(version)
+        elif version in ("latest", "all"):
+            filters["version"] = version
+        else:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "version must be latest, all or a number"})
+            return
+
+        statuses = [s.strip().lower() for s in query.get("status", []) if s.strip()]
+        if any(s not in ("open", "outdated", "resolved") for s in statuses):
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "status must be open, outdated or resolved"})
+            return
+        filters["statuses"] = statuses
+        filters["reviewer"] = (query.get("reviewer", [""])[0] or "").strip() or None
+
+        def as_time(name: str, end_of_minute: bool) -> int | None:
+            raw = (query.get(name, [""])[0] or "").strip()
+            if not raw:
+                return None
+            if raw.isdigit():
+                return int(raw)
+            parsed = parse_local_datetime_to_ts(raw, end_of_minute=end_of_minute)
+            if parsed is None:
+                raise ValueError(f"{name} must be a unix time or a date such as 2026-10-01 or 2026-10-01T12:00")
+            return parsed
+
+        try:
+            filters["from_ts"] = as_time("from", False)
+            filters["to_ts"] = as_time("to", True)
+            limit = min(max(int(query.get("limit", ["200"])[0]), 1), 1000)
+            offset = max(int(query.get("offset", ["0"])[0]), 0)
+        except ValueError as exc:
+            message = str(exc)
+            if "invalid literal" in message:
+                message = "limit and offset must be numbers"
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": message})
+            return
+
+        sort_key = (query.get("sort", ["created_at"])[0] or "created_at").strip()
+        if sort_key not in ("preview", "page_path", "reviewer", "created_at", "resolved", "version"):
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "sort must be preview, page_path, reviewer, created_at, resolved or version"},
+            )
+            return
+        sort_dir = (query.get("dir", ["desc"])[0] or "desc").strip().lower()
+        if sort_dir not in ("asc", "desc"):
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "dir must be asc or desc"})
+            return
+
+        comments = fetch_feedback(filters, sort_key=sort_key, sort_dir=sort_dir)
+        total = len(comments)
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "comments": comments[offset:offset + limit],
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "has_more": offset + limit < total,
+            },
+        )
+
     def _api_get_comments(self, query: dict[str, list[str]]) -> None:
+        if not query.get("page_path"):
+            # No page given: list comments across pages, with filters.
+            self._api_list_comments(query)
+            return
         build_raw = query.get("build_id", [""])[0]
         page_path = query.get("page_path", [""])[0] or "/"
         if not build_raw.isdigit():

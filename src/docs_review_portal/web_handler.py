@@ -8,17 +8,19 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from docs_review_portal.config import HOST, PORT
+from docs_review_portal.config import BUILD_VERSION, HOST, PORT
 from docs_review_portal.data import init_storage, purge_expired_archived_builds
 from docs_review_portal import log_buffer
 from docs_review_portal.web_api import ReviewApiMixin
 from docs_review_portal.web_common import ReviewCommonMixin
+from docs_review_portal.web_help import ReviewHelpMixin
 from docs_review_portal.web_pages import ReviewPagesMixin
 from docs_review_portal.web_preview import ReviewPreviewMixin
 
 
 class ReviewHandler(
     ReviewApiMixin,
+    ReviewHelpMixin,
     ReviewPagesMixin,
     ReviewPreviewMixin,
     ReviewCommonMixin,
@@ -56,7 +58,7 @@ class ReviewHandler(
             self._redirect("/previews")
             return
         if path == "/healthz":
-            self._send_json(HTTPStatus.OK, {"status": "ok"})
+            self._send_json(HTTPStatus.OK, {"status": "ok", "version": BUILD_VERSION})
             return
         if path == "/manage":
             self._redirect("/previews")
@@ -64,7 +66,7 @@ class ReviewHandler(
         if path == "/publications":
             self._redirect("/previews")
             return
-        if re.match(r"^/(?:publications|previews)/\d+/comments\.csv$", path):
+        if re.match(r"^/(?:publications|previews|api/builds)/\d+/comments\.csv$", path):
             self._export_preview_comments_csv(path)
             return
         if re.match(r"^/(?:publications|previews)/\d+/changed-pages$", path):
@@ -85,6 +87,27 @@ class ReviewHandler(
         if path == "/api/builds":
             self._api_get_builds()
             return
+        if re.match(r"^/api/builds/\d+$", path):
+            self._api_get_build(path)
+            return
+        if re.match(r"^/api/builds/\d+/changed-pages$", path):
+            self._api_get_changed_pages(path)
+            return
+        if path == "/api/reviews":
+            self._api_get_reviews()
+            return
+        if re.match(r"^/api/reviews/[^/]+$", path):
+            self._api_get_review(path)
+            return
+        if path == "/api/logs":
+            self._api_get_logs(query)
+            return
+        if path == "/api/imports":
+            self._api_get_imports(query)
+            return
+        if re.match(r"^/api/comments/\d+$", path):
+            self._api_get_comment(path)
+            return
         if re.match(r"^/api/builds/\d+/page-diff$", path):
             self._api_get_page_diff(path, query)
             return
@@ -93,6 +116,9 @@ class ReviewHandler(
             return
         if path == "/logs":
             self._render_logs_page(query)
+            return
+        if path == "/help":
+            self._render_help_page()
             return
         if self._serve_build_from_tagged_path(path):
             return
