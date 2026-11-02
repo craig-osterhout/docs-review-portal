@@ -111,7 +111,9 @@ def rewrite_docs_domain_urls(
             re.IGNORECASE,
         )
         attr_pattern_unquoted = re.compile(
-            r'(?P<lead>\b(?:href|src|action|poster)\s*=\s*)/(?P<path>(?!/)[^\s"\'`>]+)',
+            # Minified HTML often leaves quotes off, including for a link to the site root
+            # (href=/), so the path after the slash may be empty here just as it can be above.
+            r'(?P<lead>\b(?:href|src|action|poster)\s*=\s*)/(?P<path>(?!/)[^\s"\'`>]*)',
             re.IGNORECASE,
         )
         css_url_pattern = re.compile(r'url\((?P<quote>["\']?)/(?P<path>(?!/)[^)"\']*)(?P=quote)\)')
