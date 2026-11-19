@@ -262,6 +262,10 @@ def html_page(title: str, body: str, auto_refresh: int | None = None, embed: boo
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
 {refresh}  <title>{html.escape(title)}</title>
+  <link rel="icon" href="/_review/assets/icons/favicon-32x32.png" sizes="32x32" type="image/png">
+  <link rel="icon" href="/_review/assets/icons/favicon-48x48.png" sizes="48x48" type="image/png">
+  <link rel="icon" href="/_review/assets/icons/favicon-16x16.png" sizes="16x16" type="image/png">
+  <link rel="apple-touch-icon" href="/_review/assets/icons/apple-touch-icon.png">
   <script>{_THEME_SCRIPT}</script>
   <link rel="preload" href="/_review/assets/fonts/onest-latin.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/_review/assets/app.css">
