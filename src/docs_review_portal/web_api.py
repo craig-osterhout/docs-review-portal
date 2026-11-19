@@ -697,6 +697,7 @@ class ReviewApiMixin:
           </form>
         </section>
         <section class="panel">
+          <div class="table-scroll">
           <table>
             <thead>
               <tr>
@@ -711,6 +712,7 @@ class ReviewApiMixin:
               {rows or '<tr><td colspan="5">No log entries match.</td></tr>'}
             </tbody>
           </table>
+          </div>
           {pager_markup}
         </section>"""
         self._send_html(HTTPStatus.OK, html_page("System logs", body))

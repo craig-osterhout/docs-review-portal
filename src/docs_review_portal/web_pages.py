@@ -221,13 +221,36 @@ class ReviewPagesMixin:
           <a class="button-link" href="/help#upload">Upload preview</a>
         </section>
         <script>
+          function closeVersionMenus(except) {{
+            document.querySelectorAll('details.version-menu[open]').forEach(function (d) {{
+              if (d !== except) {{ d.open = false; }}
+            }});
+          }}
           document.addEventListener('click', function (e) {{
             document.querySelectorAll('details.version-menu[open]').forEach(function (d) {{
               if (!d.contains(e.target)) {{ d.open = false; }}
             }});
           }});
+          // The menu is placed on the screen, not inside the table, so the table's own
+          // sideways scrolling can't cut it off.
+          document.addEventListener('toggle', function (e) {{
+            var d = e.target;
+            if (!d.classList || !d.classList.contains('version-menu')) {{ return; }}
+            var list = d.querySelector('.version-menu-list');
+            if (!d.open || !list) {{ return; }}
+            var r = d.querySelector('summary').getBoundingClientRect();
+            list.style.right = Math.max(10, window.innerWidth - r.right) + 'px';
+            var top = r.bottom + 6;
+            if (top + list.offsetHeight > window.innerHeight - 10 && r.top - list.offsetHeight - 6 > 10) {{
+              top = r.top - list.offsetHeight - 6;
+            }}
+            list.style.top = top + 'px';
+          }}, true);
+          window.addEventListener('scroll', function () {{ closeVersionMenus(null); }}, true);
+          window.addEventListener('resize', function () {{ closeVersionMenus(null); }});
         </script>
         <section class="panel">
+          <div class="table-scroll">
           <table>
             <thead>
               <tr>
@@ -242,6 +265,7 @@ class ReviewPagesMixin:
               {build_table}
             </tbody>
           </table>
+          </div>
         </section>
         """
         self._send_html(HTTPStatus.OK, html_page("Previews", body, auto_refresh=auto_refresh))
@@ -549,7 +573,8 @@ class ReviewPagesMixin:
           </form>
         </section>
         <section class="panel">
-          <table>
+          <div class="table-scroll">
+          <table class="table-wide">
             <thead>
               <tr>
                 <th>{sort_link("preview", "Preview")}</th>
@@ -565,6 +590,7 @@ class ReviewPagesMixin:
               {comments_markup}
             </tbody>
           </table>
+          </div>
         </section>
         <script>
         (function() {{

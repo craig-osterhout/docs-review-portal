@@ -83,7 +83,7 @@ def _sections(base: str) -> list[tuple[str, str, str]]:
         <li>Docker needs to be running, because the script builds the site with it.</li>
         <li>Running it again with the same name adds a new version.</li>
       </ul>
-      <p>Any other static site can be uploaded with the API, see below.</p>
+      <p>Any other static site can be uploaded with the <a href="#api">API</a>.</p>
     """.replace("_PUBLISH_", publish)
 
     managing = """

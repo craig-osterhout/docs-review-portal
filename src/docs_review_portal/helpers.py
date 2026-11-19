@@ -6,6 +6,7 @@ import re
 from datetime import datetime, timezone
 from urllib.parse import unquote
 
+from .brand import LOGO_SVG
 from .config import (
     DEFAULT_REWRITE_HOST,
     INJECT_END,
@@ -220,18 +221,37 @@ def build_url(tag: str, path: str = "/", base: str | None = None) -> str:
     return f"{root}{build_path(tag, path)}"
 
 
+# Runs before the page is painted so the saved theme, or else the system theme, never flashes.
+_THEME_SCRIPT = (
+    "(function(){try{var t=localStorage.getItem('review-portal-theme');"
+    "if(t!=='light'&&t!=='dark'){t=window.matchMedia&&matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'}"
+    "document.documentElement.setAttribute('data-theme',t)}catch(e){}})()"
+)
+
+
 def html_page(title: str, body: str, auto_refresh: int | None = None, embed: bool = False) -> str:
     refresh = f'  <meta http-equiv="refresh" content="{auto_refresh}">\n' if auto_refresh else ""
     header = (
         ""
         if embed
-        else """<header class="topbar">
-    <nav class="nav">
-      <a href="/previews">Previews</a>
-      <a href="/comments">Comments</a>
-      <a href="/logs">System logs</a>
-      <a href="/help">Help</a>
-    </nav>
+        else f"""<header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="/previews" aria-label="Docker docs review, home">{LOGO_SVG}<span class="brand-label">Docs review</span></a>
+      <nav class="nav" id="site-nav" aria-label="Main">
+        <a href="/previews">Previews</a>
+        <a href="/comments">Comments</a>
+        <a href="/logs">System logs</a>
+        <a href="/help">Help</a>
+      </nav>
+      <button type="button" class="nav-toggle" data-nav-toggle aria-expanded="false" aria-controls="site-nav" aria-label="Main menu">
+        <svg class="nav-icon-open" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+        <svg class="nav-icon-close" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+      <button type="button" class="theme-toggle" data-theme-toggle aria-label="Switch between light and dark mode" title="Switch between light and dark mode">
+        <svg class="theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+        <svg class="theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.985 12.486a9 9 0 1 1-9.473-9.472c.405-.022.617.46.402.803a6 6 0 0 0 8.268 8.268c.344-.215.825-.004.803.401"/></svg>
+      </button>
+    </div>
   </header>
   """
     )
@@ -242,7 +262,10 @@ def html_page(title: str, body: str, auto_refresh: int | None = None, embed: boo
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
 {refresh}  <title>{html.escape(title)}</title>
+  <script>{_THEME_SCRIPT}</script>
+  <link rel="preload" href="/_review/assets/fonts/onest-latin.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/_review/assets/app.css">
+  <script defer src="/_review/assets/chrome.js"></script>
 </head>
 <body>
   {header}<main class="{main_class}">

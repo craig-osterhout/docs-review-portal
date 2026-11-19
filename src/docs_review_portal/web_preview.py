@@ -148,13 +148,14 @@ class ReviewPreviewMixin:
         cache_control: str,
         etag: str | None = None,
         cookies: list[str] | None = None,
+        status: HTTPStatus = HTTPStatus.OK,
     ) -> None:
         """Send a file with caching headers, compressed when the browser accepts it."""
         encoding = None
         if _is_compressible(content_type) and len(content) >= _COMPRESS_MIN_BYTES and self._accepts_gzip():
             content = gzip.compress(content, compresslevel=6, mtime=0)
             encoding = "gzip"
-        self.send_response(HTTPStatus.OK)
+        self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", cache_control)
         if etag:
@@ -311,11 +312,49 @@ class ReviewPreviewMixin:
         dest = self.headers.get("Sec-Fetch-Dest", "").lower()
         return mode == "navigate" or dest in ("document", "iframe", "frame")
 
+    def _preview_cookies(self, review_data: dict) -> list[str]:
+        """Cookies that remember which review, and which version, a visitor is in."""
+        cookies = [f"{PREVIEW_CONTEXT_COOKIE}={review_data['reviewKey']}; Path=/; SameSite=Lax"]
+        if review_data["version"] == review_data["latestVersion"]:
+            cookies.append(f"{PREVIEW_VERSION_COOKIE}=; Path=/; SameSite=Lax; Max-Age=0")
+        else:
+            cookies.append(f"{PREVIEW_VERSION_COOKIE}={review_data['version']}; Path=/; SameSite=Lax")
+        return cookies
+
+    def _send_site_404(self, build, review: dict) -> bool:
+        """Send the uploaded site's own 404 page, with a 404 status. Returns False when
+        the site has none. Its links are rewritten like any other page, but the comment
+        widget is left out because there is nothing on the page to comment on."""
+        storage_tag = str(build["tag"])
+        for candidate in ("404.html", "404/index.html"):
+            content = SITE_STORE.read_file(storage_tag, candidate)
+            if content is not None:
+                break
+        else:
+            return False
+        url_prefix = review_path(review["reviewKey"], review["version"], review["version"] == review["latestVersion"])
+        html_text = rewrite_docs_domain_urls(
+            content.decode("utf-8", errors="replace"),
+            get_build_rewrite_host(build),
+            url_prefix,
+        )
+        self._send_file_response(
+            html_text.encode("utf-8"),
+            "text/html; charset=utf-8",
+            _cache_control("text/html", is_page=True),
+            cookies=self._preview_cookies(review),
+            status=HTTPStatus.NOT_FOUND,
+        )
+        return True
+
     def _send_page_not_found(self, build, review: dict, req_path: str, rel: str) -> None:
-        """404 for a page that isn't in this version. When the review has other
-        versions, say which of them do have the page."""
+        """404 for a page that isn't in this version. The site's own 404 page is shown
+        when it has one. Otherwise, when the review has other versions, the portal says
+        which of them do have the page."""
         last_segment = rel.rsplit("/", 1)[-1]
         looks_like_page = "." not in last_segment or last_segment.lower().endswith(".html")
+        if looks_like_page and self._send_site_404(build, review):
+            return
         if len(review["versions"]) <= 1 or not looks_like_page:
             self.send_error(HTTPStatus.NOT_FOUND, "Page not found")
             return
@@ -463,11 +502,6 @@ class ReviewPreviewMixin:
             has_diff=has_diff,
             review=review_data,
         )
-        cookies = [f"{PREVIEW_CONTEXT_COOKIE}={review_data['reviewKey']}; Path=/; SameSite=Lax"]
-        if review_data["version"] == review_data["latestVersion"]:
-            cookies.append(f"{PREVIEW_VERSION_COOKIE}=; Path=/; SameSite=Lax; Max-Age=0")
-        else:
-            cookies.append(f"{PREVIEW_VERSION_COOKIE}={review_data['version']}; Path=/; SameSite=Lax")
         self._send_file_response(
-            html_text.encode("utf-8"), ctype, _cache_control(ctype, is_page=True), cookies=cookies
+            html_text.encode("utf-8"), ctype, _cache_control(ctype, is_page=True), cookies=self._preview_cookies(review_data)
         )
