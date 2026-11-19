@@ -580,7 +580,11 @@
     fitComposerToViewport(el);
 
     let dragging = false;
-    const onPointerDown = function () {
+    const onPointerDown = function (event) {
+      // Moving the box by its header is not a resize, so it never saves a size.
+      if (event.target.closest && event.target.closest(".review-composer-handle")) {
+        return;
+      }
       dragging = true;
     };
     const onPointerUp = function () {
@@ -609,11 +613,63 @@
     };
   }
 
+  // Lets the user move the composer by its header, so it can be pulled off the
+  // text it covers. It always opens next to the selection, so the new position
+  // is not remembered. The box stays fully on screen while it is dragged.
+  function setupComposerMove(el) {
+    const handle = el.querySelector(".review-composer-handle");
+    if (!handle) {
+      return;
+    }
+    const margin = 10;
+    let offsetX = 0;
+    let offsetY = 0;
+    let moving = false;
+    handle.addEventListener("pointerdown", function (event) {
+      if (event.button !== undefined && event.button !== 0) {
+        return;
+      }
+      moving = true;
+      offsetX = event.clientX - el.getBoundingClientRect().left;
+      offsetY = event.clientY - el.getBoundingClientRect().top;
+      el.classList.add("review-composer-moving");
+      try {
+        handle.setPointerCapture(event.pointerId);
+      } catch (_) {}
+      // Keeps the page text selection and the textarea focus where they are.
+      event.preventDefault();
+    });
+    handle.addEventListener("pointermove", function (event) {
+      if (!moving) {
+        return;
+      }
+      const left = Math.max(margin, Math.min(event.clientX - offsetX, window.innerWidth - el.offsetWidth - margin));
+      const top = Math.max(margin, Math.min(event.clientY - offsetY, window.innerHeight - el.offsetHeight - margin));
+      el.style.left = `${Math.round(left)}px`;
+      el.style.top = `${Math.round(top)}px`;
+      el.style.maxWidth = `${Math.max(0, window.innerWidth - left - margin)}px`;
+      el.style.maxHeight = `${Math.max(0, window.innerHeight - top - margin)}px`;
+    });
+    const stop = function (event) {
+      if (!moving) {
+        return;
+      }
+      moving = false;
+      el.classList.remove("review-composer-moving");
+      try {
+        handle.releasePointerCapture(event.pointerId);
+      } catch (_) {}
+    };
+    handle.addEventListener("pointerup", stop);
+    handle.addEventListener("pointercancel", stop);
+  }
+
   function showCommentComposer(rect, onSubmit) {
     removeCommentComposer();
     commentComposer = document.createElement("div");
     commentComposer.className = "review-comment-composer";
     commentComposer.innerHTML = `
+      <div class="review-composer-handle" title="Drag to move"><span class="review-composer-grip" aria-hidden="true">&#8942;&#8942;</span>New comment</div>
       <input type="text" class="review-composer-reviewer" placeholder="Your name" value="${escapeHtml(getReviewerName())}">
       <textarea class="review-composer-body" placeholder="Leave a comment" rows="3"></textarea>
       <div class="review-composer-error" hidden></div>
@@ -623,6 +679,7 @@
       </div>
     `;
     setupComposerResize(commentComposer, rect);
+    setupComposerMove(commentComposer);
     const reviewerInput = commentComposer.querySelector(".review-composer-reviewer");
     const textarea = commentComposer.querySelector(".review-composer-body");
     const errorEl = commentComposer.querySelector(".review-composer-error");
