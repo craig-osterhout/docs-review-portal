@@ -22,7 +22,13 @@
   const VERSIONS = Array.isArray(ctx.versions) ? ctx.versions : [];
   const HAS_VERSIONS = VERSIONS.length > 1;
   const VIEWING_OLD_VERSION = HAS_VERSIONS && Number(ctx.version) !== Number(ctx.latestVersion);
+  // Comments are normally made on the page's <main> and their positions are relative to it.
+  // Text outside it, such as a header, a footer or a navigation bar, can be commented on too.
+  // Positions for that are relative to the whole page and the selection is marked as such.
   const CONTENT_ROOT = document.querySelector("main") || document.body;
+  const BODY_ROOT = document.body;
+  // The widget's own parts, which are never part of the page being reviewed.
+  const WIDGET_UI = ".review-panel,.review-comment-composer,.review-floating-action,.review-diff-modal-overlay";
   const HAS_CUSTOM_HIGHLIGHT_API =
     typeof window.Highlight === "function" &&
     !!(window.CSS && window.CSS.highlights);
@@ -126,21 +132,23 @@
     return null;
   }
 
-  function isNodeInsideRoot(node) {
+  function isNodeInsideRoot(node, root) {
+    root = root || CONTENT_ROOT;
     if (!node) {
       return false;
     }
-    if (node === CONTENT_ROOT) {
-      return true;
-    }
     const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
-    return !!(element && CONTENT_ROOT.contains(element));
+    if (!element || element.closest(WIDGET_UI)) {
+      return false;
+    }
+    return node === root || root.contains(element);
   }
 
-  function getNodePath(node) {
+  function getNodePath(node, root) {
+    root = root || CONTENT_ROOT;
     const path = [];
     let current = node;
-    while (current && current !== CONTENT_ROOT) {
+    while (current && current !== root) {
       const parent = current.parentNode;
       if (!parent) {
         return null;
@@ -152,14 +160,14 @@
       path.unshift(index);
       current = parent;
     }
-    return current === CONTENT_ROOT ? path : null;
+    return current === root ? path : null;
   }
 
-  function resolveNodePath(path) {
+  function resolveNodePath(path, root) {
     if (!Array.isArray(path)) {
       return null;
     }
-    let current = CONTENT_ROOT;
+    let current = root || CONTENT_ROOT;
     for (const segment of path) {
       if (!current || !current.childNodes || segment < 0 || segment >= current.childNodes.length) {
         return null;
@@ -179,29 +187,54 @@
     return node.childNodes ? node.childNodes.length : 0;
   }
 
-  function serializeRange(range) {
-    if (!range || !isNodeInsideRoot(range.startContainer) || !isNodeInsideRoot(range.endContainer)) {
+  // Which part of the page a selection belongs to: <main> if it lies entirely inside it,
+  // otherwise the whole page. Null for a selection in the widget itself or outside the page.
+  function rootForRange(range) {
+    if (!range) {
       return null;
     }
-    const startPath = getNodePath(range.startContainer);
-    const endPath = getNodePath(range.endContainer);
+    if (isNodeInsideRoot(range.startContainer, CONTENT_ROOT) && isNodeInsideRoot(range.endContainer, CONTENT_ROOT)) {
+      return CONTENT_ROOT;
+    }
+    if (
+      BODY_ROOT !== CONTENT_ROOT &&
+      isNodeInsideRoot(range.startContainer, BODY_ROOT) &&
+      isNodeInsideRoot(range.endContainer, BODY_ROOT)
+    ) {
+      return BODY_ROOT;
+    }
+    return null;
+  }
+
+  function serializeRange(range) {
+    const root = rootForRange(range);
+    if (!root) {
+      return null;
+    }
+    const startPath = getNodePath(range.startContainer, root);
+    const endPath = getNodePath(range.endContainer, root);
     if (!startPath || !endPath) {
       return null;
     }
-    return {
+    const serialized = {
       startPath: startPath,
       startOffset: range.startOffset,
       endPath: endPath,
       endOffset: range.endOffset,
     };
+    if (root !== CONTENT_ROOT) {
+      serialized.root = "body";
+    }
+    return serialized;
   }
 
   function deserializeRange(selection) {
     if (!selection || typeof selection !== "object") {
       return null;
     }
-    const startNode = resolveNodePath(selection.startPath);
-    const endNode = resolveNodePath(selection.endPath);
+    const root = selection.root === "body" ? BODY_ROOT : CONTENT_ROOT;
+    const startNode = resolveNodePath(selection.startPath, root);
+    const endNode = resolveNodePath(selection.endPath, root);
     if (!startNode || !endNode) {
       return null;
     }
@@ -232,9 +265,9 @@
   const SKIPPED_TEXT = "script,style,noscript,svg,.review-panel,.review-comment-composer,.review-floating-action";
 
   // The text nodes of the page that a reader would select from, in order.
-  function pageTextNodes() {
+  function pageTextNodes(root) {
     const nodes = [];
-    const walker = document.createTreeWalker(CONTENT_ROOT, NodeFilter.SHOW_TEXT);
+    const walker = document.createTreeWalker(root || CONTENT_ROOT, NodeFilter.SHOW_TEXT);
     let node = walker.nextNode();
     while (node) {
       const parent = node.parentElement;
@@ -248,7 +281,7 @@
 
   // The page text just before and after a selection, saved when a comment is made.
   function selectionContext(range) {
-    const nodes = pageTextNodes();
+    const nodes = pageTextNodes(rootForRange(range) || CONTENT_ROOT);
     const starts = new Map();
     let full = "";
     nodes.forEach(function (node) {
@@ -303,14 +336,14 @@
   // carried forward from an earlier version have no saved position, and for them
   // this is how the highlight finds the text on the new page. When the same text
   // appears several times, the saved surroundings pick the right one.
-  function locateTextRange(text, contextBefore, contextAfter) {
+  function locateTextRange(text, contextBefore, contextAfter, root) {
     const wanted = String(text || "").replace(/\s+/g, "");
     if (!wanted) {
       return null;
     }
     const spots = [];
     const chars = [];
-    pageTextNodes().forEach(function (node) {
+    pageTextNodes(root).forEach(function (node) {
       const value = node.nodeValue || "";
       for (let i = 0; i < value.length; i += 1) {
         if (!/\s/.test(value.charAt(i))) {
@@ -372,8 +405,16 @@
   }
 
   function rangeForComment(comment) {
-    return deserializeRange(comment.selection) ||
-      locateTextRange(comment.selected_text, comment.context_before, comment.context_after);
+    const wholePage = !!(comment.selection && comment.selection.root === "body");
+    const root = wholePage ? BODY_ROOT : CONTENT_ROOT;
+    const saved = deserializeRange(comment.selection);
+    // Positions relative to the whole page are easily thrown off by something the page adds
+    // or removes at the top, such as a banner, so check they still land on the same text.
+    const compact = function (value) { return String(value || "").replace(/\s+/g, ""); };
+    if (saved && (!wholePage || compact(saved.toString()) === compact(comment.selected_text))) {
+      return saved;
+    }
+    return locateTextRange(comment.selected_text, comment.context_before, comment.context_after, root);
   }
 
   function onSelectionComplete() {

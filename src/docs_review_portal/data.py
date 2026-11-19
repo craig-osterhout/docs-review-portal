@@ -1262,7 +1262,9 @@ class _VisibleTextParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self._skip_depth = 0
         self._main_depth = 0
+        self._body_depth = 0
         self.main_parts: list[str] = []
+        self.body_parts: list[str] = []
         self.all_parts: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -1270,17 +1272,23 @@ class _VisibleTextParser(HTMLParser):
             self._skip_depth += 1
         elif tag == "main":
             self._main_depth += 1
+        elif tag == "body":
+            self._body_depth += 1
 
     def handle_endtag(self, tag: str) -> None:
         if tag in self._SKIP_TAGS:
             self._skip_depth = max(0, self._skip_depth - 1)
         elif tag == "main":
             self._main_depth = max(0, self._main_depth - 1)
+        elif tag == "body":
+            self._body_depth = max(0, self._body_depth - 1)
 
     def handle_data(self, data: str) -> None:
         if self._skip_depth:
             return
         self.all_parts.append(data)
+        if self._body_depth:
+            self.body_parts.append(data)
         if self._main_depth:
             self.main_parts.append(data)
 
@@ -1393,7 +1401,7 @@ def _locate_selection(
     return new_before, new_after
 
 
-def _page_visible_text(storage_tag: str, page_path: str) -> str | None:
+def _page_visible_text(storage_tag: str, page_path: str, whole_page: bool = False) -> str | None:
     trimmed = page_path.strip("/")
     if not trimmed:
         candidates = ["index.html"]
@@ -1405,6 +1413,9 @@ def _page_visible_text(storage_tag: str, page_path: str) -> str | None:
             continue
         parser = _VisibleTextParser()
         parser.feed(raw.decode("utf-8", errors="replace"))
+        if whole_page:
+            # For a comment made outside <main>, such as in a footer: all of the page's text.
+            return "".join(parser.body_parts or parser.all_parts)
         return "".join(parser.main_parts or parser.all_parts)
     return None
 
@@ -1454,9 +1465,19 @@ def carry_comments_forward(
         if kind != "preview" or not _normalize_for_match(selected):
             outdated += 1
             continue
-        if page_path not in page_text:
-            page_text[page_path] = _page_visible_text(new_storage_tag, page_path)
-        text = page_text[page_path]
+        # A comment made outside <main> is matched against the whole page, and its copy keeps a
+        # note of that so the widget looks in the same place.
+        whole_page = False
+        selection_raw = root["selection_json"] if "selection_json" in root.keys() else None
+        if selection_raw:
+            try:
+                whole_page = json.loads(str(selection_raw)).get("root") == "body"
+            except Exception:
+                whole_page = False
+        cache_key = f"{page_path}\n{'body' if whole_page else 'main'}"
+        if cache_key not in page_text:
+            page_text[cache_key] = _page_visible_text(new_storage_tag, page_path, whole_page)
+        text = page_text[cache_key]
         located = None
         if text is not None:
             located = _locate_selection(
@@ -1478,7 +1499,7 @@ def carry_comments_forward(
                 "line_start": None,
                 "line_end": None,
                 "selected_text": root["selected_text"],
-                "selection_json": None,
+                "selection_json": json.dumps({"root": "body"}) if whole_page else None,
                 "body": root["body"],
                 "reviewer": root["reviewer"],
                 "parent_id": None,
@@ -1749,12 +1770,20 @@ def normalize_selection_payload(payload: Any) -> dict[str, Any] | None:
             raise ValueError(f"{key} must be a non-negative integer")
         return value
 
-    return {
+    normalized_selection = {
         "startPath": parse_path("startPath"),
         "startOffset": parse_offset("startOffset"),
         "endPath": parse_path("endPath"),
         "endOffset": parse_offset("endOffset"),
     }
+    # Positions are normally relative to the page's <main>. "body" means the selection was
+    # outside it, such as in a header or footer, so positions are relative to the whole page.
+    root = payload.get("root")
+    if root is not None:
+        if root != "body":
+            raise ValueError("selection root must be body when it is given")
+        normalized_selection["root"] = "body"
+    return normalized_selection
 
 
 def fetch_replies(conn: DBConnectionProxy, parent_ids: list[int]) -> dict[int, list[dict[str, Any]]]:

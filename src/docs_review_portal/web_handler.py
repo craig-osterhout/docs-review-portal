@@ -124,6 +124,14 @@ class ReviewHandler(
             return
         if self._serve_build_from_context(path):
             return
+        extracted = self._extract_tag_from_path(path)
+        if extracted and extracted[0].lower() != "favicon.ico":
+            # Most likely a preview that was deleted, or a mistyped name.
+            self.send_error(
+                HTTPStatus.NOT_FOUND,
+                f"There is no preview named {extracted[0]!r}. It may have been deleted.",
+            )
+            return
         self.send_error(HTTPStatus.NOT_FOUND, "Route not found")
 
     def route_post(self) -> None:

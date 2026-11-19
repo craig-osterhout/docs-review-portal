@@ -59,6 +59,10 @@ RESERVED_ROOT_SEGMENTS = {
     "help",
 }
 
+# Preview files read from storage are kept in memory so repeat requests are quick. This is
+# the most it holds, in megabytes. Set it to 0 to turn the cache off.
+FILE_CACHE_MB = int(os.environ.get("REVIEW_FILE_CACHE_MB", "64"))
+
 # GitHub Actions polling integration
 _github_watches_raw = (os.environ.get("GITHUB_WATCHES") or "").strip()
 try:
