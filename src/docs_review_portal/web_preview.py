@@ -11,6 +11,12 @@ from http import HTTPStatus
 from urllib.parse import urlparse
 
 from docs_review_portal import import_status
+from docs_review_portal.asset_rewrite import (
+    REWRITABLE_EXTENSIONS,
+    REWRITER_VERSION,
+    rewrite_asset,
+    rewrite_page_extras,
+)
 from docs_review_portal.config import (
     FILE_CACHE_MB,
     PREVIEW_CONTEXT_COOKIE,
@@ -112,6 +118,33 @@ class _FileCache:
 
 
 _FILE_CACHE = _FileCache(FILE_CACHE_MB * 1024 * 1024)
+
+
+class _ExistsCache:
+    """Remembers whether a version of a site has a file, so rewriting a script that
+    mentions the same paths again and again checks each one only once."""
+
+    def __init__(self, max_items: int = 50000) -> None:
+        self._max_items = max_items
+        self._items: OrderedDict[tuple, bool] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def check(self, storage_tag: str, stamp: int, rel_path: str) -> bool:
+        key = (storage_tag, stamp, rel_path)
+        with self._lock:
+            known = self._items.get(key)
+            if known is not None:
+                self._items.move_to_end(key)
+                return known
+        found = SITE_STORE.exists(storage_tag, rel_path)
+        with self._lock:
+            self._items[key] = found
+            while len(self._items) > self._max_items:
+                self._items.popitem(last=False)
+        return found
+
+
+_EXISTS_CACHE = _ExistsCache()
 
 
 class ReviewPreviewMixin:
@@ -312,6 +345,35 @@ class ReviewPreviewMixin:
         dest = self.headers.get("Sec-Fetch-Dest", "").lower()
         return mode == "navigate" or dest in ("document", "iframe", "frame")
 
+    def _asset_prefix(self, build, version: int | None) -> str:
+        """The URL prefix this version of a preview is served under, such as /name/ or
+        /name/_v/2/. The latest version needs no lookup."""
+        if version is None:
+            return review_path(build["review_key"], int(build["version"]), True)
+        info = review_context_for(build)
+        return review_path(info["reviewKey"], info["version"], info["version"] == info["latestVersion"])
+
+    def _rewrite_page_scripts(self, html_text: str, build, prefix: str) -> str:
+        storage_tag = str(build["tag"])
+        stamp = int(build["updated_at"] or build["created_at"])
+        return rewrite_page_extras(
+            html_text, prefix, lambda rel: _EXISTS_CACHE.check(storage_tag, stamp, rel)
+        )
+
+    def _rewritten_asset(self, content: bytes, rel: str, build, prefix: str) -> bytes:
+        """A script or stylesheet with the preview's prefix on the paths the site has."""
+        storage_tag = str(build["tag"])
+        stamp = int(build["updated_at"] or build["created_at"])
+        key = (int(build["id"]), storage_tag, rel, stamp, "rewritten", prefix, REWRITER_VERSION)
+        cached = _FILE_CACHE.get(key)
+        if cached is not None:
+            return cached
+        result = rewrite_asset(
+            content, rel, prefix, lambda candidate: _EXISTS_CACHE.check(storage_tag, stamp, candidate)
+        )
+        _FILE_CACHE.put(key, result)
+        return result
+
     def _preview_cookies(self, review_data: dict) -> list[str]:
         """Cookies that remember which review, and which version, a visitor is in."""
         cookies = [f"{PREVIEW_CONTEXT_COOKIE}={review_data['reviewKey']}; Path=/; SameSite=Lax"]
@@ -338,6 +400,7 @@ class ReviewPreviewMixin:
             get_build_rewrite_host(build),
             url_prefix,
         )
+        html_text = self._rewrite_page_scripts(html_text, build, url_prefix)
         self._send_file_response(
             html_text.encode("utf-8"),
             "text/html; charset=utf-8",
@@ -423,10 +486,19 @@ class ReviewPreviewMixin:
 
         # Anything that isn't a page can be tagged without reading it, because a build's
         # files only change when the build is updated, and that changes the tag.
+        # Scripts and stylesheets are rewritten for the preview's prefix, so the tag also
+        # covers the prefix and the rewriting itself.
+        def asset_etag(rel_path: str, prefix: str | None) -> str:
+            seed = rel_path if not prefix else f"{rel_path}|{prefix}|{REWRITER_VERSION}"
+            digest = hashlib.blake2b(seed.encode("utf-8"), digest_size=8).hexdigest()
+            return f'W/"{int(build["id"]):x}-{stamp:x}-{digest}"'
+
         etag = None
+        asset_prefix = None
         if not is_page_request:
-            digest = hashlib.blake2b(rel.encode("utf-8"), digest_size=8).hexdigest()
-            etag = f'W/"{int(build["id"]):x}-{stamp:x}-{digest}"'
+            if rel.lower().endswith(REWRITABLE_EXTENSIONS):
+                asset_prefix = self._asset_prefix(build, version)
+            etag = asset_etag(rel, asset_prefix)
             guessed = mimetypes.guess_type(rel)[0] or "application/octet-stream"
             if self._etag_matches(etag):
                 self._send_not_modified(etag, _cache_control(guessed, is_page=False))
@@ -473,7 +545,11 @@ class ReviewPreviewMixin:
         ctype = mimetypes.guess_type(resolved_rel)[0] or "application/octet-stream"
         if not resolved_rel.lower().endswith(".html"):
             # Not a page: no comment widget, no cookies, and a browser may reuse it.
-            tag_for_file = etag or f'W/"{int(build["id"]):x}-{stamp:x}-{hashlib.blake2b(resolved_rel.encode("utf-8"), digest_size=8).hexdigest()}"'
+            prefix_for_file = None
+            if resolved_rel.lower().endswith(REWRITABLE_EXTENSIONS):
+                prefix_for_file = asset_prefix or self._asset_prefix(build, version)
+                content = self._rewritten_asset(content, resolved_rel, build, prefix_for_file)
+            tag_for_file = etag if (etag and prefix_for_file == asset_prefix) else asset_etag(resolved_rel, prefix_for_file)
             self._send_file_response(content, ctype, _cache_control(ctype, is_page=False), etag=tag_for_file)
             return
 
@@ -487,6 +563,7 @@ class ReviewPreviewMixin:
             get_build_rewrite_host(build),
             url_prefix,
         )
+        html_text = self._rewrite_page_scripts(html_text, build, url_prefix)
         changed_pages_raw = build["changed_pages"] if "changed_pages" in build.keys() else None
         changed_pages_list = [ln.strip() for ln in str(changed_pages_raw).splitlines() if ln.strip()] if changed_pages_raw else []
         page_path = canonical_page_path(f"/{resolved_rel}")

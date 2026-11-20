@@ -124,6 +124,11 @@ class SiteStore:
     def read_file(self, tag: str, rel_path: str) -> bytes | None:
         raise NotImplementedError
 
+    def exists(self, tag: str, rel_path: str) -> bool:
+        """Whether the site has this file. Stores override it with a check that doesn't
+        download the file."""
+        return self.read_file(tag, rel_path) is not None
+
     def delete_build(self, tag: str) -> None:
         raise NotImplementedError
 
@@ -261,6 +266,15 @@ class FilesystemSiteStore(SiteStore):
             return None
         return file_path.read_bytes()
 
+    def exists(self, tag: str, rel_path: str) -> bool:
+        site_root = self._site_dir(tag, "site").resolve()
+        file_path = (site_root / rel_path).resolve()
+        try:
+            file_path.relative_to(site_root)
+        except ValueError:
+            return False
+        return file_path.is_file()
+
     def delete_build(self, tag: str) -> None:
         build_dir = self._build_dir(tag)
         if build_dir.exists():
@@ -385,6 +399,9 @@ class GCSSiteStore(SiteStore):
         except self._not_found:
             return None
 
+    def exists(self, tag: str, rel_path: str) -> bool:
+        return self._bucket.blob(f"{self._snapshot_prefix(tag, 'site')}{rel_path}").exists()
+
     def delete_build(self, tag: str) -> None:
         self._delete_prefix(self._prefix_with_root(f"builds/{tag}/"))
 
@@ -484,6 +501,23 @@ class LocalCacheSiteStore(SiteStore):
         if not path.is_file():
             return None
         return path.read_bytes()
+
+    def exists(self, tag: str, rel_path: str) -> bool:
+        backing_root = (self._backing / tag / "site").resolve()
+        backing_path = (backing_root / rel_path.lstrip("/")).resolve()
+        try:
+            backing_path.relative_to(backing_root)
+        except ValueError:
+            return False
+        if backing_path.is_file():
+            return True
+        site_root = self._site_dir(tag).resolve()
+        path = (site_root / rel_path.lstrip("/")).resolve()
+        try:
+            path.relative_to(site_root)
+        except ValueError:
+            return False
+        return path.is_file()
 
     def delete_build(self, tag: str) -> None:
         local_dir = self._local / tag
